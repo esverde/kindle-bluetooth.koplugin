@@ -284,59 +284,84 @@ function BluetoothController:reloadDevice()
     return success
 end
 
--- Scan for JOYSTICK devices from KOReader's device registry
+-- Scan for JOYSTICK / Bluetooth input devices from sysfs and KOReader registry
 function BluetoothController:scanJoystickDevices()
     local devices = {}
-    local input = Device.input
+    local seen_paths = {}
 
-    if not input or not input.opened_devices then
-        logger.warn("BT Plugin: Device.input or opened_devices not available")
-        return devices
-    end
+    -- Known Kindle internal system devices to ignore
+    local system_devices = {
+        ["pt_mt"] = true,
+        ["goodix-ts"] = true,
+        ["bd71828-pwrkey"] = true,
+        ["max77696-onkey"] = true,
+        ["gpio-keys"] = true,
+        ["hall_sensor"] = true,
+        ["accel"] = true,
+    }
 
-    -- Check opened_devices for joystick devices
-    for dev_path, _ in pairs(input.opened_devices) do
-        local event_num = dev_path:match("/dev/input/event(%d+)")
-        if event_num then
-            -- Read device name from sysfs
-            local sys_name_path = "/sys/class/input/event" .. event_num .. "/device/name"
-            local name_file = io.open(sys_name_path, "r")
-            local device_name = "Unknown Device"
+    -- Scan sysfs /sys/class/input/event0 .. event15
+    for i = 0, 15 do
+        local dev_path = "/dev/input/event" .. i
+        local sys_name_path = "/sys/class/input/event" .. i .. "/device/name"
+        local name_file = io.open(sys_name_path, "r")
+        if name_file then
+            local raw_name = name_file:read("*line")
+            name_file:close()
 
-            if name_file then
-                device_name = name_file:read("*line") or device_name
-                name_file:close()
-            end
+            if raw_name and raw_name ~= "" then
+                local clean_name = raw_name:gsub("^%s*(.-)%s*$", "%1")
+                local lower_name = clean_name:lower()
 
-            -- Check if this is a joystick device
-            local is_joystick = false
-
-            -- Method 1: Match against configured profiles
-            if self.full_config and self.full_config.profiles then
-                for _, profile in pairs(self.full_config.profiles) do
-                    if profile.device_path == dev_path then
-                        is_joystick = true
+                -- Filter out known Kindle internal hardware devices
+                local is_system = false
+                for sys_name, _ in pairs(system_devices) do
+                    if lower_name:find(sys_name, 1, true) then
+                        is_system = true
                         break
                     end
                 end
-            end
 
-            -- Method 2: Match by device name patterns (fallback)
-            if not is_joystick then
-                if device_name:match("Controller") or device_name:match("Gamepad") or
-                   device_name:match("Joystick") or device_name:match("Xbox") or
-                   device_name:match("PlayStation") then
-                    is_joystick = true
+                if not is_system then
+                    local is_controller = false
+
+                    -- Check 1: Match configured profiles
+                    if self.full_config and self.full_config.profiles then
+                        for _, profile in pairs(self.full_config.profiles) do
+                            if profile.device_path == dev_path then
+                                is_controller = true
+                                break
+                            end
+                        end
+                    end
+
+                    -- Check 2: Match typical Bluetooth/gamepad device name keywords
+                    if not is_controller then
+                        if lower_name:find("controller") or lower_name:find("gamepad") or
+                           lower_name:find("joystick") or lower_name:find("xbox") or
+                           lower_name:find("playstation") or lower_name:find("8bitdo") or
+                           lower_name:find("wireless") or lower_name:find("bluetooth") or
+                           lower_name:find("hid") or lower_name:find("keyboard") then
+                            is_controller = true
+                        end
+                    end
+
+                    -- Check 3: Check if already opened in KOReader
+                    local is_opened = self:isDeviceOpened(dev_path)
+                    if is_opened then
+                        is_controller = true
+                    end
+
+                    if is_controller and not seen_paths[dev_path] then
+                        seen_paths[dev_path] = true
+                        table.insert(devices, {
+                            path = dev_path,
+                            name = clean_name,
+                            opened = is_opened,
+                        })
+                        logger.info("BT Plugin: Found input device: " .. clean_name .. " at " .. dev_path .. " (opened=" .. tostring(is_opened) .. ")")
+                    end
                 end
-            end
-
-            if is_joystick then
-                table.insert(devices, {
-                    path = dev_path,
-                    name = device_name,
-                    connected = true
-                })
-                logger.info("BT Plugin: Found JOYSTICK device: " .. device_name .. " at " .. dev_path)
             end
         end
     end
@@ -638,29 +663,60 @@ function BluetoothController:addToMainMenu(menu_items)
         end,
     })
 
-    -- 2. Connected Devices
+    -- 2. Connected Devices (Sub-menu with device names and detailed info dialogs)
     table.insert(sub_items, {
         text = _("已连接设备"),
         keep_menu_open = true,
-        callback = function()
+        sub_item_table_func = function()
             local devices = self:scanJoystickDevices()
             local current_device = self.config.device_path
-            local msg = ""
+            local items = {}
+
             if #devices == 0 then
-                msg = _("未找到手柄设备")
+                table.insert(items, {
+                    text = _("未发现蓝牙手柄"),
+                    enabled_func = function() return false end,
+                })
             else
                 for _, dev in ipairs(devices) do
-                    local status = ""
-                    if dev.path == current_device then
-                        status = dev.connected and "[当前]" or "[已配置]"
+                    local is_current = (dev.path == current_device)
+                    local status_tag = ""
+                    local status_desc = ""
+
+                    if is_current then
+                        if dev.opened then
+                            status_tag = _(" [当前]")
+                            status_desc = _("已连接并在 KOReader 中打开")
+                        else
+                            status_tag = _(" [已配置]")
+                            status_desc = _("已配置为此设备（未打开）")
+                        end
                     else
-                        status = dev.connected and "[已连接]" or "[可用]"
+                        if dev.opened then
+                            status_tag = _(" [已连接]")
+                            status_desc = _("已在 KOReader 中打开")
+                        else
+                            status_tag = _(" [可用]")
+                            status_desc = _("系统蓝牙已连接（可配置使用）")
+                        end
                     end
-                    msg = msg .. string.format("%s %s\n", status, dev.name)
+
+                    table.insert(items, {
+                        text = dev.name .. status_tag,
+                        callback = function()
+                            local detail_msg = string.format(
+                                _("设备名称: %s\n设备节点: %s\n连接状态: %s"),
+                                dev.name,
+                                dev.path,
+                                status_desc
+                            )
+                            UIManager:show(InfoMessage:new{ text = detail_msg, timeout = 4 })
+                        end,
+                    })
                 end
             end
 
-            UIManager:show(InfoMessage:new{ text = msg, timeout = 2 })
+            return items
         end,
     })
 
