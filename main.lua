@@ -607,56 +607,11 @@ end
 -- =======================================================
 
 function BluetoothController:cleanupBluetoothDumps()
-    local total_deleted = 0
-
-    local cleanup_paths = {
-        {
-            dir = "/mnt/us",
-            patterns = {
-                "audiomgrd_*.core",
-                "btmanagerd_*.core",
-                "Indexer_Dump_*.txt"
-            }
-        },
-        {
-            dir = "/mnt/us/documents",
-            patterns = {
-                "audiomgrd_*_crash_*.tgz",
-                "audiomgrd_*_crash_*.txt",
-                "btmanagerd_*_crash_*.tgz",
-                "btmanagerd_*_crash_*.txt",
-                "audiomgrd_*_crash_*.sdr",
-                "btmanagerd_*_crash_*.sdr"
-            }
-        }
-    }
-
-    for _, path_config in ipairs(cleanup_paths) do
-        local dir = path_config.dir
-        for _, pattern in ipairs(path_config.patterns) do
-            local find_cmd = string.format("find '%s' -maxdepth 1 -name '%s' 2>/dev/null", dir, pattern)
-            local pipe = io.popen(find_cmd)
-            if pipe then
-                local files = {}
-                for file in pipe:lines() do
-                    table.insert(files, file)
-                end
-                pipe:close()
-
-                for _, file in ipairs(files) do
-                    local rm_cmd = string.format("rm -rf '%s' 2>/dev/null", file)
-                    local success = os.execute(rm_cmd)
-                    if success == 0 or success == true then
-                        total_deleted = total_deleted + 1
-                        logger.info("BT Plugin: Deleted dump file: " .. file)
-                    end
-                end
-            end
-        end
-    end
-
-    logger.info("BT Plugin: Cleanup completed, deleted " .. total_deleted .. " files/folders")
-    return total_deleted
+    local cmd = "rm -rf /mnt/us/audiomgrd_*.core /mnt/us/btmanagerd_*.core /mnt/us/Indexer_Dump_*.txt " ..
+                "/mnt/us/documents/audiomgrd_*_crash_* /mnt/us/documents/btmanagerd_*_crash_* " ..
+                "/mnt/us/documents/*btmanagerd*.sdr /mnt/us/documents/*audiomgrd*.sdr 2>/dev/null"
+    os.execute(cmd)
+    logger.info("BT Plugin: Cleaned up bluetooth dump files")
 end
 
 -- =======================================================
@@ -857,9 +812,9 @@ function BluetoothController:addToMainMenu(menu_items)
     table.insert(sub_items, {
         text = _("清理蓝牙垃圾"),
         callback = function()
-            local count = self:cleanupBluetoothDumps()
+            self:cleanupBluetoothDumps()
             UIManager:show(InfoMessage:new{
-                text = string.format(_("已清理 %d 个文件"), count),
+                text = _("已清理蓝牙转储垃圾文件"),
                 timeout = 2
             })
         end
