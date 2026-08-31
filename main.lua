@@ -40,6 +40,9 @@ local BluetoothController = WidgetContainer:extend {
 
     -- Hook activity state (per-instance, allows disabling without unregistering)
     _hook_active = true,
+
+    -- Wakeup reconnect task handle
+    _wakeup_task = nil,
 }
 
 function BluetoothController:init()
@@ -406,8 +409,14 @@ end
 
 function BluetoothController:onOutOfScreenSaver()
     logger.info("BT Plugin: Device wakeup detected, scheduling reload...")
+    if self._wakeup_task then
+        UIManager:unschedule(self._wakeup_task)
+        self._wakeup_task = nil
+    end
+
     local delay = self.wakeup_delay or 3
-    UIManager:scheduleIn(delay, function()
+    self._wakeup_task = UIManager:scheduleIn(delay, function()
+        self._wakeup_task = nil
         if self:deviceExists(self.config.device_path) then
             logger.info("BT Plugin: Wakeup - Device found, reloading...")
             if self:reloadDevice() then
@@ -817,6 +826,10 @@ function BluetoothController:addToMainMenu(menu_items)
 end
 
 function BluetoothController:onExit()
+    if self._wakeup_task then
+        UIManager:unschedule(self._wakeup_task)
+        self._wakeup_task = nil
+    end
     return true
 end
 
