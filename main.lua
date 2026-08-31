@@ -224,26 +224,6 @@ end
 --  Device Connection Management
 -- =======================================================
 
-function BluetoothController:ensureConnected()
-    local path = self.config.device_path
-    if not path or path == "" then return false end
-
-    if self:isDeviceOpened(path) then return true end
-
-    -- Check if device file exists
-    if not self:deviceExists(path) then
-        logger.info("BT Plugin: Device " .. path .. " not found")
-        return false
-    end
-
-    local success, err = self:_attemptOpenDevice(path)
-    if not success then
-        logger.warn("BT Plugin: Failed to open -> " .. tostring(err))
-    end
-
-    return success
-end
-
 function BluetoothController:deviceExists(path)
     if not path or path == "" then return false end
     local file = io.open(path, "r")
@@ -254,51 +234,47 @@ function BluetoothController:deviceExists(path)
     return false
 end
 
--- Helper: encapsulate critical section for opening device
-function BluetoothController:_attemptOpenDevice(path)
-    local input = Device.input
-    if not input then return false, "No Input Module" end
-
-    -- Reset shared state on new connection
-    _shared_axis_values = {}
-    _shared_triggered = false
-
-    local success, err = pcall(function() input:open(path) end)
-
-    if success then
-        self:cleanupBluetoothDumps()
-    end
-
-    return success, err
-end
-
-function BluetoothController:reloadDevice()
-    local path = self.config.device_path
+function BluetoothController:openDevice(path, is_reload)
+    path = path or self.config.device_path
     if not path or path == "" then
         logger.warn("BT Plugin: No device path configured")
         return false
     end
 
     local input = Device.input
+    if not input then return false end
 
-    -- Close if already open
+    -- Close first if already opened and this is a reload
     if self:isDeviceOpened(path) then
-        logger.warn("BT Plugin: Reload - Closing old connection " .. path)
+        if not is_reload then return true end
+        logger.info("BT Plugin: Reload - closing previous device " .. path)
         pcall(function() input:close(path) end)
     end
 
-    -- Reset shared state on reload
+    if not self:deviceExists(path) then
+        logger.info("BT Plugin: Device " .. path .. " not found")
+        return false
+    end
+
+    -- Reset shared axis tracking state
     _shared_axis_values = {}
     _shared_triggered = false
 
-    local success = pcall(function() input:open(path) end)
-
-    -- Auto cleanup dump files after successful reload
+    local success, err = pcall(function() input:open(path) end)
     if success then
-        self:cleanupBluetoothDumps()
+        logger.info("BT Plugin: Opened device " .. path)
+    else
+        logger.warn("BT Plugin: Failed to open " .. path .. " -> " .. tostring(err))
     end
-
     return success
+end
+
+function BluetoothController:ensureConnected()
+    return self:openDevice(self.config.device_path, false)
+end
+
+function BluetoothController:reloadDevice()
+    return self:openDevice(self.config.device_path, true)
 end
 
 -- Scan for JOYSTICK / Bluetooth input devices from sysfs and KOReader registry
