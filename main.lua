@@ -3,43 +3,24 @@ local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local SpinWidget = require("ui/widget/spinwidget")
 
 local Event = require("ui/event")
 local logger = require("logger")
-local DataStorage = require("datastorage")
 local time = require("ui/time")
 local _ = require("gettext")
 local ffi = require("ffi")
-
--- Add plugin directory to package.path to ensure we can require 'ble.manager'
-local function setup_plugin_path()
-    local info = debug.getinfo(1, "S")
-    local source = info.source
-    -- Handle @/path/to/script.lua structure
-    local base_dir = source:match("@(.*/)")
-    if base_dir then
-        package.path = base_dir .. "?.lua;" .. package.path
-    end
-end
-setup_plugin_path()
-
 local C = ffi.C
-local BLEManager = nil
--- Use pcall to load BLE manager so failure doesn't crash the whole plugin
-local status, valid_manager_or_err = pcall(require, "ble_manager")
-if status and valid_manager_or_err then
-    BLEManager = valid_manager_or_err
-else
-    logger.warn("BT Plugin: Failed to load ble.manager: " .. tostring(valid_manager_or_err))
-end
 
+local AXIS_CENTER_DEFAULT = 32768
+local AXIS_THRESHOLD_DEFAULT = 16384
 
 -- MODULE-LEVEL shared state (persists across all instances)
 -- This is critical because KOReader may create multiple plugin instances
 local _shared_last_trigger_time = nil  -- Time of last page turn
 local _shared_hook_registered = false  -- Whether hook has been registered
-local _shared_triggered = false  -- Whether joystick has triggered (must return to center to reset)
-local _shared_axis_values = {}  -- Track all axis values for all-axes-centered check
+local _shared_triggered = false        -- Whether joystick has triggered (must return to center to reset)
+local _shared_axis_values = {}         -- Track all axis values for all-axes-centered check
 
 local BluetoothController = WidgetContainer:extend {
     name = "BluetoothController",
@@ -71,12 +52,7 @@ function BluetoothController:init()
     -- Prevent duplicate hook registration on reload
     self:registerInputHook()
 
-    -- Always initialize BLE Manager if available (Mixed Mode)
-    if BLEManager then
-        BLEManager:init(function(data) self:handleBLEInput(data) end)
-    end
-
-    -- Attempt initial device connection (Classic / Configured BLE)
+    -- Attempt initial device connection
     self:ensureConnected()
 end
 
@@ -96,8 +72,6 @@ end
 -- =======================================================
 --  Settings Management
 -- =======================================================
-
-
 
 function BluetoothController:loadSettings()
     local file = io.open(self.settings_file, "r")
@@ -124,7 +98,6 @@ function BluetoothController:loadSettings()
         self.trigger_cooldown_ms = full_config.common.trigger_cooldown_ms or 500
         self.config.invert_layout = full_config.common.invert_layout or false
         self.active_profile = full_config.common.active_profile or "xbox_wireless_controller"
-        self.plugin_mode = full_config.common.plugin_mode or "classic"
     end
 
     -- Load active profile configuration
@@ -139,11 +112,7 @@ function BluetoothController:loadSettings()
         self.config.dpad_map = profile.dpad_map
         self.config.analog_map = profile.analog_map
         self.config.analog_center = profile.analog_center
-        self.config.analog_map = profile.analog_map
-        self.config.analog_center = profile.analog_center
         self.config.analog_threshold = profile.axis_threshold
-        self.config.protocol = profile.protocol or "classic"
-        self.config.mac_address = profile.mac_address
 
         logger.info("BT Plugin: Loaded profile '" .. (profile.name or self.active_profile) .. "'")
     else
@@ -206,9 +175,6 @@ end
 --  Input Hook Management
 -- =======================================================
 
--- Register input event hook
--- Note: KOReader uses function chaining for hooks and doesn't support unregistration.
--- We use a flag-based approach to control whether our hook is active.
 function BluetoothController:registerInputHook()
     -- Only register once per KOReader session (module-level check)
     if _shared_hook_registered then
@@ -233,18 +199,9 @@ end
 -- =======================================================
 
 function BluetoothController:ensureConnected()
-    -- Branch logic based on protocol
-    if self.config.protocol == "ble" then
-        if BLEManager then
-             return BLEManager:connect(self.config.mac_address)
-        else
-             logger.warn("BT Plugin: BLE Manager not loaded")
-             return false
-        end
-    end
-
-    -- Classic Logic
     local path = self.config.device_path
+    if not path or path == "" then return false end
+
     if self:isDeviceOpened(path) then return true end
 
     -- Check if device file exists
@@ -262,6 +219,7 @@ function BluetoothController:ensureConnected()
 end
 
 function BluetoothController:deviceExists(path)
+    if not path or path == "" then return false end
     local file = io.open(path, "r")
     if file then
         file:close()
@@ -349,7 +307,6 @@ function BluetoothController:scanJoystickDevices()
                 for _, profile in pairs(self.full_config.profiles) do
                     if profile.device_path == dev_path then
                         is_joystick = true
-                        -- Don't override device_name - use actual name from sysfs
                         break
                     end
                 end
@@ -367,7 +324,7 @@ function BluetoothController:scanJoystickDevices()
             if is_joystick then
                 table.insert(devices, {
                     path = dev_path,
-                    name = device_name,  -- Always use actual device name from sysfs
+                    name = device_name,
                     connected = true
                 })
                 logger.info("BT Plugin: Found JOYSTICK device: " .. device_name .. " at " .. dev_path)
@@ -418,7 +375,6 @@ end
 function BluetoothController:setBluetoothState(enable)
     local val = enable and 0 or 1  -- BTflightMode: 0 = BT on, 1 = BT off
     local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
-    -- In Lua 5.1, os.execute returns exit status (0 = success), not boolean
     local exit_code = os.execute(cmd)
 
     if exit_code ~= 0 then
@@ -444,10 +400,8 @@ end
 
 function BluetoothController:onOutOfScreenSaver()
     logger.info("BT Plugin: Device wakeup detected, scheduling reload...")
-    -- Use configured wakeup delay (default 3s) to allow Bluetooth stack to recover/reconnect
     local delay = self.wakeup_delay or 3
     UIManager:scheduleIn(delay, function()
-        -- Only attempt reload if device file exists (controller is connected)
         if self:deviceExists(self.config.device_path) then
             logger.info("BT Plugin: Wakeup - Device found, reloading...")
             if self:reloadDevice() then
@@ -478,7 +432,7 @@ end
 function BluetoothController:parseInputDirection(ev)
     -- Handle key press events
     if ev.type == C.EV_KEY and (ev.value == 1 or ev.value == 2) then
-        return self.config.key_map[ev.code]
+        return self.config.key_map and self.config.key_map[ev.code]
     end
 
     -- Handle axis events
@@ -493,49 +447,17 @@ function BluetoothController:parseInputDirection(ev)
     return nil
 end
 
--- =======================================================
---  BLE Handling
--- =======================================================
-
-function BluetoothController:handleBLEInput(data)
-    -- Check for nil or insufficient data
-    if not data or #data < 2 then
-        -- logger.warn("BT Plugin: Ignored short BLE packet, len=" .. (#data or 0))
-        return
-    end
-
-    -- Assuming Standard Gamepad Report: [LeftX, LeftY, RightX, RightY, Buttons...]
-    -- Map to Linux Event Codes (ABS_X=0, ABS_Y=1)
-
-    -- Byte 1: X Axis (0-255) -> Map to signed (-128..127) for handleInputEvent
-    local raw_x = string.byte(data, 1) or 128
-    local val_x = raw_x - 128
-
-    -- Byte 2: Y Axis (0-255)
-    local raw_y = string.byte(data, 2) or 128
-    local val_y = raw_y - 128
-
-    -- Construct Virtual Events
-    local ev_x = { type = C.EV_ABS, code = 0, value = val_x }
-    local ev_y = { type = C.EV_ABS, code = 1, value = val_y }
-
-    -- Process Events
-    self:handleInputEvent(ev_x)
-    self:handleInputEvent(ev_y)
-end
-
 -- Parse D-pad discrete axis input (codes 16, 17 with values -1, 0, 1)
 function BluetoothController:parseDpadInput(ev)
     if ev.value == 0 then return nil end
-    local axis_map = self.config.dpad_map[ev.code]
+    local axis_map = self.config.dpad_map and self.config.dpad_map[ev.code]
     return axis_map and axis_map[ev.value]
 end
 
 -- Parse analog joystick input (codes 0, 1 with values 0-65535)
--- Uses COMBINED debouncing: state-based (must return to center) + time-based (cooldown)
--- Parse analog joystick input (codes 0, 1 with values 0-65535)
 -- Uses COMBINED debouncing: state-based (must return to deadzone) + time-based
 function BluetoothController:parseAnalogInput(ev)
+    if not self.config.analog_map then return nil end
     local mapping = self.config.analog_map[ev.code]
     if not mapping then return nil end
 
@@ -572,7 +494,7 @@ function BluetoothController:parseAnalogInput(ev)
 
     if _shared_last_trigger_time then
         local last_ms = time.to_ms(_shared_last_trigger_time)
-        local cooldown_ms = (self.trigger_cooldown_ms or 500)  -- Default 500ms if not configured
+        local cooldown_ms = (self.trigger_cooldown_ms or 500)
         if (now_ms - last_ms) < cooldown_ms then
             return nil
         end
@@ -598,16 +520,13 @@ function BluetoothController:getAxisCenter(axis_code)
     return AXIS_CENTER_DEFAULT
 end
 
-
 -- =======================================================
 --  Bluetooth Dump File Cleanup
 -- =======================================================
 
--- Clean up Bluetooth-related dump files
 function BluetoothController:cleanupBluetoothDumps()
     local total_deleted = 0
 
-    -- Define cleanup targets with safe, specific patterns
     local cleanup_paths = {
         {
             dir = "/mnt/us",
@@ -630,11 +549,9 @@ function BluetoothController:cleanupBluetoothDumps()
         }
     }
 
-    -- Clean up files matching patterns
     for _, path_config in ipairs(cleanup_paths) do
         local dir = path_config.dir
         for _, pattern in ipairs(path_config.patterns) do
-            -- Use find command to locate and count matching files
             local find_cmd = string.format("find '%s' -maxdepth 1 -name '%s' 2>/dev/null", dir, pattern)
             local pipe = io.popen(find_cmd)
             if pipe then
@@ -644,7 +561,6 @@ function BluetoothController:cleanupBluetoothDumps()
                 end
                 pipe:close()
 
-                -- Delete each file/directory
                 for _, file in ipairs(files) do
                     local rm_cmd = string.format("rm -rf '%s' 2>/dev/null", file)
                     local success = os.execute(rm_cmd)
@@ -668,10 +584,7 @@ end
 function BluetoothController:addToMainMenu(menu_items)
     local sub_items = {}
 
-    -- 1. Plugin Mode Switch (always first)
-    self:_addPluginModeSwitch(sub_items)
-
-    -- 2. Bluetooth Toggle (shared)
+    -- 1. Bluetooth Toggle
     table.insert(sub_items, {
         text = _("蓝牙开关"),
         keep_menu_open = true,
@@ -685,62 +598,7 @@ function BluetoothController:addToMainMenu(menu_items)
         end,
     })
 
-    -- 3. Mode-specific menu items
-    if self.plugin_mode == "ble" then
-        self:_buildBLEMenu(sub_items)
-    else
-        self:_buildClassicMenu(sub_items)
-    end
-
-    menu_items.bluetooth_controller = {
-        text = _("蓝牙翻页器"),
-        sorting_hint = "tools",
-        sub_item_table = sub_items,
-    }
-end
-
--- =======================================================
---  Plugin Mode Switch
--- =======================================================
-
-function BluetoothController:_addPluginModeSwitch(sub_items)
-    table.insert(sub_items, {
-        text = _("插件模式"),
-        sub_item_table = {
-            {
-                text = _("经典蓝牙"),
-                checked_func = function() return self.plugin_mode ~= "ble" end,
-                callback = function()
-                    self.plugin_mode = "classic"
-                    if self.full_config and self.full_config.common then
-                        self.full_config.common.plugin_mode = "classic"
-                        self:saveFullConfig()
-                    end
-                    UIManager:show(InfoMessage:new{ text = _("已切换到经典蓝牙模式，请重新打开菜单"), timeout = 2 })
-                end,
-            },
-            {
-                text = _("BLE蓝牙"),
-                checked_func = function() return self.plugin_mode == "ble" end,
-                callback = function()
-                    self.plugin_mode = "ble"
-                    if self.full_config and self.full_config.common then
-                        self.full_config.common.plugin_mode = "ble"
-                        self:saveFullConfig()
-                    end
-                    UIManager:show(InfoMessage:new{ text = _("已切换到BLE蓝牙模式，请重新打开菜单"), timeout = 2 })
-                end,
-            },
-        },
-    })
-end
-
--- =======================================================
---  Classic Bluetooth Menu (restored from reference code)
--- =======================================================
-
-function BluetoothController:_buildClassicMenu(sub_items)
-    -- 1. Connected Devices
+    -- 2. Connected Devices
     table.insert(sub_items, {
         text = _("已连接设备"),
         keep_menu_open = true,
@@ -758,7 +616,7 @@ function BluetoothController:_buildClassicMenu(sub_items)
                     else
                         status = dev.connected and "[已连接]" or "[可用]"
                     end
-                    msg = msg .. string.format("%s %s", status, dev.name)
+                    msg = msg .. string.format("%s %s\n", status, dev.name)
                 end
             end
 
@@ -766,7 +624,7 @@ function BluetoothController:_buildClassicMenu(sub_items)
         end,
     })
 
-    -- 2. Switch Profile (sub-menu, classic profiles only)
+    -- 3. Switch Profile
     table.insert(sub_items, {
         text = _("切换配置"),
         keep_menu_open = true,
@@ -775,39 +633,33 @@ function BluetoothController:_buildClassicMenu(sub_items)
 
             if self.full_config and self.full_config.profiles then
                 for profile_id, profile in pairs(self.full_config.profiles) do
-                    -- Only show classic profiles in classic mode
-                    if (profile.protocol or "classic") ~= "ble" then
-                        table.insert(profiles, {
-                            text = profile.name or profile_id,
-                            checked_func = function()
-                                return self.active_profile == profile_id
-                            end,
-                            callback = function()
-                                -- Update active profile
-                                self.active_profile = profile_id
+                    table.insert(profiles, {
+                        text = profile.name or profile_id,
+                        checked_func = function()
+                            return self.active_profile == profile_id
+                        end,
+                        callback = function()
+                            self.active_profile = profile_id
 
-                                -- Save to config file
-                                if self.full_config and self.full_config.common then
-                                    self.full_config.common.active_profile = profile_id
-                                    self:saveFullConfig()
-                                end
+                            if self.full_config and self.full_config.common then
+                                self.full_config.common.active_profile = profile_id
+                                self:saveFullConfig()
+                            end
 
-                                -- Reload settings and device
-                                self:loadSettings()
-                                if self:reloadDevice() then
-                                    UIManager:show(InfoMessage:new{
-                                        text = _("已切换到 ") .. (profile.name or profile_id),
-                                        timeout = 2
-                                    })
-                                else
-                                    UIManager:show(InfoMessage:new{
-                                        text = _("配置已切换，但未找到设备"),
-                                        timeout = 2
-                                    })
-                                end
-                            end,
-                        })
-                    end
+                            self:loadSettings()
+                            if self:reloadDevice() then
+                                UIManager:show(InfoMessage:new{
+                                    text = _("已切换到 ") .. (profile.name or profile_id),
+                                    timeout = 2
+                                })
+                            else
+                                UIManager:show(InfoMessage:new{
+                                    text = _("配置已切换，但未找到设备"),
+                                    timeout = 2
+                                })
+                            end
+                        end,
+                    })
                 end
             end
 
@@ -815,14 +667,13 @@ function BluetoothController:_buildClassicMenu(sub_items)
         end,
     })
 
-    -- 3. Invert direction
+    -- 4. Invert direction
     table.insert(sub_items, {
         text = _("反转方向"),
         checked_func = function() return self.config.invert_layout end,
         callback = function()
             self.config.invert_layout = not self.config.invert_layout
 
-            -- Save to full config
             if self.full_config and self.full_config.common then
                 self.full_config.common.invert_layout = self.config.invert_layout
                 self:saveFullConfig()
@@ -830,7 +681,7 @@ function BluetoothController:_buildClassicMenu(sub_items)
         end
     })
 
-    -- 4. Joystick Mode (only show if controller supports D-Pad)
+    -- 5. Joystick Mode (only enabled if controller supports D-Pad)
     table.insert(sub_items, {
         text = _("摇杆模式"),
         enabled_func = function()
@@ -842,9 +693,8 @@ function BluetoothController:_buildClassicMenu(sub_items)
                 checked_func = function() return self.config.use_analog_mode end,
                 callback = function()
                     self.config.use_analog_mode = true
-                    _shared_triggered = false  -- Reset lock state
+                    _shared_triggered = false
 
-                    -- Save to full config
                     if self.full_config and self.full_config.profiles and self.active_profile then
                         local profile = self.full_config.profiles[self.active_profile]
                         if profile then
@@ -860,7 +710,6 @@ function BluetoothController:_buildClassicMenu(sub_items)
                 callback = function()
                     self.config.use_analog_mode = false
 
-                    -- Save to full config
                     if self.full_config and self.full_config.profiles and self.active_profile then
                         local profile = self.full_config.profiles[self.active_profile]
                         if profile then
@@ -873,12 +722,11 @@ function BluetoothController:_buildClassicMenu(sub_items)
         }
     })
 
-    -- 5. Wakeup Delay
+    -- 6. Wakeup Delay
     table.insert(sub_items, {
         text = _("唤醒延迟"),
         keep_menu_open = true,
         callback = function()
-            local SpinWidget = require("ui/widget/spinwidget")
             local current_delay = self.wakeup_delay or 3
             UIManager:show(SpinWidget:new{
                 title_text = _("设置唤醒延迟（秒）"),
@@ -891,7 +739,6 @@ function BluetoothController:_buildClassicMenu(sub_items)
                 callback = function(spin)
                     self.wakeup_delay = spin.value
 
-                    -- Save to full config
                     if self.full_config and self.full_config.common then
                         self.full_config.common.wakeup_delay = spin.value
                         self:saveFullConfig()
@@ -906,7 +753,7 @@ function BluetoothController:_buildClassicMenu(sub_items)
         end,
     })
 
-    -- 6. Reload device
+    -- 7. Reload device
     table.insert(sub_items, {
         text = _("重新加载设备"),
         callback = function()
@@ -919,7 +766,7 @@ function BluetoothController:_buildClassicMenu(sub_items)
         end
     })
 
-    -- 7. Clean up Bluetooth dump files
+    -- 8. Clean up Bluetooth dump files
     table.insert(sub_items, {
         text = _("清理蓝牙垃圾"),
         callback = function()
@@ -930,166 +777,15 @@ function BluetoothController:_buildClassicMenu(sub_items)
             })
         end
     })
+
+    menu_items.bluetooth_controller = {
+        text = _("蓝牙翻页器"),
+        sorting_hint = "tools",
+        sub_item_table = sub_items,
+    }
 end
-
--- =======================================================
---  BLE Bluetooth Menu
--- =======================================================
-
-function BluetoothController:_buildBLEMenu(sub_items)
-    -- 1. Switch Profile (BLE profiles only)
-    table.insert(sub_items, {
-        text = _("切换配置"),
-        keep_menu_open = true,
-        sub_item_table_func = function()
-            local profiles = {}
-
-            if self.full_config and self.full_config.profiles then
-                for profile_id, profile in pairs(self.full_config.profiles) do
-                    -- Only show BLE profiles in BLE mode
-                    if profile.protocol == "ble" then
-                        table.insert(profiles, {
-                            text = profile.name or profile_id,
-                            checked_func = function()
-                                return self.active_profile == profile_id
-                            end,
-                            callback = function()
-                                self.active_profile = profile_id
-
-                                if self.full_config and self.full_config.common then
-                                    self.full_config.common.active_profile = profile_id
-                                    self:saveFullConfig()
-                                end
-
-                                self:loadSettings()
-
-                                -- Connect BLE device
-                                if profile.mac_address and profile.mac_address ~= "" and BLEManager then
-                                    BLEManager:connect(profile.mac_address)
-                                    UIManager:show(InfoMessage:new{
-                                        text = _("正在连接 BLE: ") .. (profile.name or profile_id),
-                                        timeout = 2
-                                    })
-                                else
-                                    UIManager:show(InfoMessage:new{
-                                        text = _("已切换到 ") .. (profile.name or profile_id),
-                                        timeout = 2
-                                    })
-                                end
-                            end,
-                        })
-                    end
-                end
-            end
-
-            if #profiles == 0 then
-                table.insert(profiles, {
-                    text = _("无 BLE 配置"),
-                    enabled_func = function() return false end,
-                })
-            end
-
-            return profiles
-        end,
-    })
-
-    -- 2. Connect BLE
-    table.insert(sub_items, {
-        text = _("连接 BLE 设备"),
-        callback = function()
-            if not BLEManager then
-                UIManager:show(InfoMessage:new{ text = _("BLE 服务不可用"), timeout = 2 })
-                return
-            end
-
-            local mac = self.config.mac_address
-            if mac and mac ~= "" then
-                BLEManager:connect(mac)
-                UIManager:show(InfoMessage:new{ text = _("正在连接 BLE..."), timeout = 2 })
-            else
-                UIManager:show(InfoMessage:new{ text = _("当前配置无 MAC 地址"), timeout = 2 })
-            end
-        end
-    })
-
-    -- 3. Disconnect BLE
-    table.insert(sub_items, {
-        text = _("断开 BLE 连接"),
-        callback = function()
-            if BLEManager then
-                BLEManager:disconnect()
-                UIManager:show(InfoMessage:new{ text = _("已断开 BLE"), timeout = 2 })
-            else
-                UIManager:show(InfoMessage:new{ text = _("BLE 服务不可用"), timeout = 2 })
-            end
-        end
-    })
-
-    -- 4. Invert direction (shared)
-    table.insert(sub_items, {
-        text = _("反转方向"),
-        checked_func = function() return self.config.invert_layout end,
-        callback = function()
-            self.config.invert_layout = not self.config.invert_layout
-
-            if self.full_config and self.full_config.common then
-                self.full_config.common.invert_layout = self.config.invert_layout
-                self:saveFullConfig()
-            end
-        end
-    })
-
-    -- 5. Wakeup Delay (shared)
-    table.insert(sub_items, {
-        text = _("唤醒延迟"),
-        keep_menu_open = true,
-        callback = function()
-            local SpinWidget = require("ui/widget/spinwidget")
-            local current_delay = self.wakeup_delay or 3
-            UIManager:show(SpinWidget:new{
-                title_text = _("设置唤醒延迟（秒）"),
-                value = current_delay,
-                value_min = 1,
-                value_max = 10,
-                value_step = 1,
-                value_hold_step = 2,
-                ok_text = _("确定"),
-                callback = function(spin)
-                    self.wakeup_delay = spin.value
-
-                    if self.full_config and self.full_config.common then
-                        self.full_config.common.wakeup_delay = spin.value
-                        self:saveFullConfig()
-                    end
-
-                    UIManager:show(InfoMessage:new{
-                        text = _("唤醒延迟已设置为 ") .. spin.value .. _(" 秒"),
-                        timeout = 2
-                    })
-                end
-            })
-        end,
-    })
-
-    -- 6. Clean up Bluetooth dump files (shared)
-    table.insert(sub_items, {
-        text = _("清理蓝牙垃圾"),
-        callback = function()
-            local count = self:cleanupBluetoothDumps()
-            UIManager:show(InfoMessage:new{
-                text = string.format(_("已清理 %d 个文件"), count),
-                timeout = 2
-            })
-        end
-    })
-end
-
-
 
 function BluetoothController:onExit()
-    if BLEManager then
-        BLEManager:disconnect()
-    end
     return true
 end
 

@@ -20,7 +20,6 @@ return {
         -- Xbox Wireless Controller 配置
         ["xbox_wireless_controller"] = {
             name = "Xbox Wireless Controller",     -- 显示名称
-            protocol = "classic",                  -- 协议类型: classic (默认)
             device_path = "/dev/input/event6",     -- 设备路径
             supports_dpad = true,                  -- 支持 D-Pad 模式切换
             use_analog_mode = true,                -- 当前使用模式 (true=模拟摇杆, false=D-Pad)
@@ -46,36 +45,6 @@ return {
             -- 模拟摇杆映射 (codes: 0=X轴, 1=Y轴)
             analog_map = {
                 [1] = { axis = "Y", low_dir = 1, high_dir = -1 },  -- Y轴: 上=上一页, 下=下一页
-                [0] = { axis = "X", low_dir = -1, high_dir = 1 }   -- X轴: 左=上一页, 右=下一页
-            },
-        },
-
-        -- Bluetooth HID 手柄配置 (黑鲨左手柄等)
-        ["bluetooth_hid"] = {
-            name = "Bluetooth HID",                -- 显示名称
-            protocol = "ble",                      -- 协议类型: ble
-            mac_address = "04:33:85:2C:BF:5B",     -- BLE MAC 地址 (请修改此处)
-            -- service_uuid = "1812",              -- 可选: HID Service
-            -- report_uuid = "2a4d",               -- 可选: Report Characteristic
-            device_path = "/dev/input/event2",     -- (仅作兼容保留)
-            supports_dpad = false,                 -- 不支持 D-Pad 模式，仅模拟摇杆
-            use_analog_mode = true,                -- 固定为模拟摇杆模式
-
-            -- 轴心配置 (范围: -127 到 127, 中心值: 0)
-            axis_center = 0,
-            axis_threshold = 95,
-            axis_max = 127,
-            analog_center = { [0] = 0, [1] = 0 },
-
-            -- 按键映射: 正数=下一页, 负数=上一页
-            key_map = {
-                [304] = 1, [305] = 1, [310] = 1,   -- 下一页按键
-                [307] = -1, [308] = -1, [312] = -1, -- 上一页按键
-            },
-
-            -- 模拟摇杆映射 (codes: 0=X轴, 1=Y轴)
-            analog_map = {
-                [1] = { axis = "Y", low_dir = -1, high_dir = 1 },  -- Y轴: 上=上一页, 下=下一页
                 [0] = { axis = "X", low_dir = -1, high_dir = 1 }   -- X轴: 左=上一页, 右=下一页
             },
         },
