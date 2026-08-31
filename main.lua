@@ -177,6 +177,23 @@ function BluetoothController:saveFullConfig()
     logger.info("BT Plugin: Configuration saved")
 end
 
+function BluetoothController:setCommonSetting(key, value)
+    self.full_config = self.full_config or {}
+    self.full_config.common = self.full_config.common or {}
+    self.full_config.common[key] = value
+    self:saveFullConfig()
+end
+
+function BluetoothController:setActiveProfileSetting(key, value)
+    if self.full_config and self.full_config.profiles and self.active_profile then
+        local profile = self.full_config.profiles[self.active_profile]
+        if profile then
+            profile[key] = value
+            self:saveFullConfig()
+        end
+    end
+end
+
 -- =======================================================
 --  Input Hook Management
 -- =======================================================
@@ -736,11 +753,7 @@ function BluetoothController:addToMainMenu(menu_items)
                         end,
                         callback = function()
                             self.active_profile = profile_id
-
-                            if self.full_config and self.full_config.common then
-                                self.full_config.common.active_profile = profile_id
-                                self:saveFullConfig()
-                            end
+                            self:setCommonSetting("active_profile", profile_id)
 
                             self:loadSettings()
                             if self:reloadDevice() then
@@ -769,11 +782,7 @@ function BluetoothController:addToMainMenu(menu_items)
         checked_func = function() return self.config.invert_layout end,
         callback = function()
             self.config.invert_layout = not self.config.invert_layout
-
-            if self.full_config and self.full_config.common then
-                self.full_config.common.invert_layout = self.config.invert_layout
-                self:saveFullConfig()
-            end
+            self:setCommonSetting("invert_layout", self.config.invert_layout)
         end
     })
 
@@ -790,14 +799,7 @@ function BluetoothController:addToMainMenu(menu_items)
                 callback = function()
                     self.config.use_analog_mode = true
                     _shared_triggered = false
-
-                    if self.full_config and self.full_config.profiles and self.active_profile then
-                        local profile = self.full_config.profiles[self.active_profile]
-                        if profile then
-                            profile.use_analog_mode = true
-                            self:saveFullConfig()
-                        end
-                    end
+                    self:setActiveProfileSetting("use_analog_mode", true)
                 end
             },
             {
@@ -805,14 +807,7 @@ function BluetoothController:addToMainMenu(menu_items)
                 checked_func = function() return not self.config.use_analog_mode end,
                 callback = function()
                     self.config.use_analog_mode = false
-
-                    if self.full_config and self.full_config.profiles and self.active_profile then
-                        local profile = self.full_config.profiles[self.active_profile]
-                        if profile then
-                            profile.use_analog_mode = false
-                            self:saveFullConfig()
-                        end
-                    end
+                    self:setActiveProfileSetting("use_analog_mode", false)
                 end
             }
         }
@@ -834,11 +829,7 @@ function BluetoothController:addToMainMenu(menu_items)
                 ok_text = _("确定"),
                 callback = function(spin)
                     self.wakeup_delay = spin.value
-
-                    if self.full_config and self.full_config.common then
-                        self.full_config.common.wakeup_delay = spin.value
-                        self:saveFullConfig()
-                    end
+                    self:setCommonSetting("wakeup_delay", spin.value)
 
                     UIManager:show(InfoMessage:new{
                         text = _("唤醒延迟已设置为 ") .. spin.value .. _(" 秒"),
