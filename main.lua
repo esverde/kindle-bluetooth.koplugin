@@ -436,6 +436,16 @@ function BluetoothController:pokeActivity()
 end
 
 function BluetoothController:handleInputEvent(ev)
+    -- Ignore all events if bluetooth controller device is not currently opened
+    if not self:isDeviceOpened(self.config.device_path) then
+        return
+    end
+
+    -- Ignore multi-touch ABS events (ABS_MT_* codes >= 47: ABS_MT_POSITION_X=53, ABS_MT_POSITION_Y=54, etc.)
+    if ev.type == C.EV_ABS and ev.code >= 47 then
+        return
+    end
+
     local direction = self:parseInputDirection(ev)
     if not direction then return end
 
