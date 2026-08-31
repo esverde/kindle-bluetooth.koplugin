@@ -99,31 +99,22 @@ function BluetoothController:loadSettings()
     if not full_config then return end
 
     -- Load common settings
-    if full_config.common then
-        self.wakeup_delay = full_config.common.wakeup_delay or 3
-        self.trigger_cooldown_ms = full_config.common.trigger_cooldown_ms or 500
-        self.config.invert_layout = full_config.common.invert_layout or false
-        self.active_profile = full_config.common.active_profile or "xbox_wireless_controller"
-    end
+    local common = full_config.common or {}
+    self.wakeup_delay = common.wakeup_delay or 3
+    self.trigger_cooldown_ms = common.trigger_cooldown_ms or 500
+    self.active_profile = common.active_profile or "xbox_wireless_controller"
+    self.config.invert_layout = common.invert_layout or false
 
     -- Load active profile configuration
-    if full_config.profiles and full_config.profiles[self.active_profile] then
-        local profile = full_config.profiles[self.active_profile]
-
-        -- Merge profile settings into self.config
-        self.config.device_path = profile.device_path
-        self.config.supports_dpad = profile.supports_dpad
-        self.config.use_analog_mode = profile.use_analog_mode
-        self.config.key_map = profile.key_map
-        self.config.dpad_map = profile.dpad_map
-        self.config.analog_map = profile.analog_map
-        self.config.analog_center = profile.analog_center
-        self.config.analog_threshold = profile.axis_threshold
-
+    local profile = full_config.profiles and full_config.profiles[self.active_profile]
+    if profile then
+        for k, v in pairs(profile) do
+            self.config[k] = v
+        end
+        self.config.analog_threshold = profile.axis_threshold or profile.analog_threshold or AXIS_THRESHOLD_DEFAULT
         logger.info("BT Plugin: Loaded profile '" .. (profile.name or self.active_profile) .. "'")
     else
         logger.warn("BT Plugin: Profile '" .. tostring(self.active_profile) .. "' not found in bluetooth.lua")
-        logger.warn("BT Plugin: Please ensure bluetooth.lua exists and contains valid profile configuration")
     end
 
     -- Store full config for menu access
