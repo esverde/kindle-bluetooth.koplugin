@@ -23,6 +23,7 @@ local _shared_last_power_reset_time = 0    -- Timestamp of last screensaver time
 local _shared_hook_registered = false      -- Whether hook has been registered
 local _shared_triggered = false            -- Whether joystick has triggered (must return to center to reset)
 local _shared_axis_values = {}             -- Track all axis values for all-axes-centered check
+local _current_active_controller = nil     -- Track the active controller instance for global hook delegate
 
 local BluetoothController = WidgetContainer:extend {
     name = "BluetoothController",
@@ -178,16 +179,19 @@ end
 -- =======================================================
 
 function BluetoothController:registerInputHook()
+    -- Always update active controller instance reference
+    _current_active_controller = self
+
     -- Only register once per KOReader session (module-level check)
     if _shared_hook_registered then
         self._hook_active = true  -- Re-activate if previously disabled
         return
     end
 
-    local controller = self  -- Capture reference for closure
-    local hook_func = function(input_instance, ev)
-        -- Only process events when hook is active
-        if controller._hook_active then
+    local hook_func = function(_input_instance, ev)
+        local controller = _current_active_controller
+        -- Only process events when hook is active on current controller
+        if controller and controller._hook_active then
             controller:handleInputEvent(ev)
         end
     end
