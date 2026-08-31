@@ -14,13 +14,15 @@ local C = ffi.C
 
 local AXIS_CENTER_DEFAULT = 32768
 local AXIS_THRESHOLD_DEFAULT = 16384
+local POWER_RESET_INTERVAL = 60  -- 系统休眠计时器重置间隔（秒）
 
 -- MODULE-LEVEL shared state (persists across all instances)
 -- This is critical because KOReader may create multiple plugin instances
-local _shared_last_trigger_time = nil  -- Time of last page turn
-local _shared_hook_registered = false  -- Whether hook has been registered
-local _shared_triggered = false        -- Whether joystick has triggered (must return to center to reset)
-local _shared_axis_values = {}         -- Track all axis values for all-axes-centered check
+local _shared_last_trigger_time = nil      -- Time of last page turn
+local _shared_last_power_reset_time = 0    -- Timestamp of last screensaver timer reset
+local _shared_hook_registered = false      -- Whether hook has been registered
+local _shared_triggered = false            -- Whether joystick has triggered (must return to center to reset)
+local _shared_axis_values = {}             -- Track all axis values for all-axes-centered check
 
 local BluetoothController = WidgetContainer:extend {
     name = "BluetoothController",
@@ -417,9 +419,24 @@ end
 --  Input Event Processing
 -- =======================================================
 
+-- Reset Kindle system screensaver/sleep countdown (throttled)
+function BluetoothController:pokeActivity()
+    local now = os.time()
+    if (now - _shared_last_power_reset_time) >= POWER_RESET_INTERVAL then
+        _shared_last_power_reset_time = now
+        local PowerD = Device:getPowerDevice()
+        if PowerD and PowerD.resetT1Timeout then
+            PowerD:resetT1Timeout()
+        end
+    end
+end
+
 function BluetoothController:handleInputEvent(ev)
     local direction = self:parseInputDirection(ev)
     if not direction then return end
+
+    -- Keep screen/system awake
+    self:pokeActivity()
 
     if self.config.invert_layout then
         direction = -direction
