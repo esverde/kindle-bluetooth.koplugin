@@ -25,10 +25,8 @@ return {
             use_analog_mode = true,                -- 当前使用模式 (true=模拟摇杆, false=D-Pad)
 
             -- 轴心配置 (范围: 0-65535, 中心值: 32768)
-            axis_center = 32768,
-            axis_threshold = 16384,
-            axis_max = 65535,
-            analog_center = { [0] = 32768, [1] = 32768 },
+            axis_threshold = 16384,                -- 死区阈值
+            analog_center = { [0] = 32768, [1] = 32768 },  -- 各轴中心值（可逐轴校准）
 
             -- 按键映射: 正数=下一页, 负数=上一页
             key_map = {
@@ -44,8 +42,8 @@ return {
 
             -- 模拟摇杆映射 (codes: 0=X轴, 1=Y轴)
             analog_map = {
-                [1] = { axis = "Y", low_dir = 1, high_dir = -1 },  -- Y轴: 上=上一页, 下=下一页
-                [0] = { axis = "X", low_dir = -1, high_dir = 1 }   -- X轴: 左=上一页, 右=下一页
+                [1] = { low_dir = 1, high_dir = -1 },   -- Y轴: 上=上一页, 下=下一页
+                [0] = { low_dir = -1, high_dir = 1 }    -- X轴: 左=上一页, 右=下一页
             },
         },
     }

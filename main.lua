@@ -3,11 +3,12 @@ local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local SpinWidget = require("ui/widget/spinwidget")
 
 local Event = require("ui/event")
+local dump = require("dump")
 local logger = require("logger")
 local time = require("ui/time")
+local util = require("util")
 local _ = require("gettext")
 local ffi = require("ffi")
 local C = ffi.C
@@ -15,31 +16,70 @@ local C = ffi.C
 local AXIS_CENTER_DEFAULT = 32768
 local AXIS_THRESHOLD_DEFAULT = 16384
 local POWER_RESET_INTERVAL = 60  -- 系统休眠计时器重置间隔（秒）
+local STATE_CACHE_INTERVAL = 2   -- 蓝牙开关状态缓存时长（秒）
+local ABS_MT_FIRST = 47          -- ABS_MT_SLOT，其后均为多点触控轴
+
+-- Kindle 内部输入设备（永不当作手柄）
+local SYSTEM_DEVICE_NAMES = {
+    "pt_mt", "goodix-ts", "bd71828-pwrkey", "max77696-onkey",
+    "gpio-keys", "hall_sensor", "accel",
+}
+
+-- 典型蓝牙手柄/键盘的设备名关键词
+local CONTROLLER_KEYWORDS = {
+    "controller", "gamepad", "joystick", "xbox", "playstation",
+    "8bitdo", "wireless", "bluetooth", "hid", "keyboard",
+}
+
+-- 蓝牙栈崩溃时留在存储卡上的转储文件
+local DUMP_PATTERNS = {
+    "/mnt/us/audiomgrd_*.core",
+    "/mnt/us/btmanagerd_*.core",
+    "/mnt/us/Indexer_Dump_*.txt",
+    "/mnt/us/documents/audiomgrd_*_crash_*",
+    "/mnt/us/documents/btmanagerd_*_crash_*",
+    "/mnt/us/documents/*btmanagerd*.sdr",
+    "/mnt/us/documents/*audiomgrd*.sdr",
+}
 
 -- MODULE-LEVEL shared state (persists across all instances)
 -- This is critical because KOReader may create multiple plugin instances
-local _shared_last_trigger_time = nil      -- Time of last page turn
+local _shared_last_trigger_time = nil      -- Time of last page turn (time_fts)
 local _shared_last_power_reset_time = 0    -- Timestamp of last screensaver timer reset
 local _shared_hook_registered = false      -- Whether hook has been registered
 local _shared_triggered = false            -- Whether joystick has triggered (must return to center to reset)
 local _shared_axis_values = {}             -- Track all axis values for all-axes-centered check
 local _current_active_controller = nil     -- Track the active controller instance for global hook delegate
 
+-- 任何影响输入解析的变更（换设备、换配置、换模式）都必须清掉去抖状态
+local function resetInputState()
+    _shared_axis_values = {}
+    _shared_triggered = false
+end
+
+local function nameMatches(lower_name, keywords)
+    for _i, keyword in ipairs(keywords) do
+        if lower_name:find(keyword, 1, true) then return true end
+    end
+    return false
+end
+
 local BluetoothController = WidgetContainer:extend {
     name = "BluetoothController",
     is_doc_only = false,
 
-    -- State variables for Bluetooth toggle debouncing
-    last_action_time = 0,
-    target_state = false,
-
-    -- Configuration loaded from bluetooth.lua
+    -- Configuration loaded from bluetooth.lua (applyConfig 会用实例表覆盖)
     config = {},
     full_config = {},
-    settings_file = nil,  -- Dynamically set in getPluginDir()
+    settings_file = nil,  -- Dynamically set in init()
 
-    -- Hook activity state (per-instance, allows disabling without unregistering)
-    _hook_active = true,
+    -- 配置文件缺失时仍需可用的默认值
+    wakeup_delay = 3,
+    trigger_cooldown_ms = 500,
+
+    -- Cached hardware state (see getDisplayState)
+    _state_cached = false,
+    _state_time = 0,
 
     -- Wakeup reconnect task handle
     _wakeup_task = nil,
@@ -48,8 +88,8 @@ local BluetoothController = WidgetContainer:extend {
 function BluetoothController:init()
     if not Device:isKindle() then return end
 
-    local plugin_dir = self:getPluginDir()
-    self.settings_file = plugin_dir .. "/bluetooth.lua"
+    -- self.path 由 PluginLoader 注入（pluginloader.lua: plugin_module.path = plugin_root）
+    self.settings_file = self.path .. "/bluetooth.lua"
 
     self:loadSettings()
     self.ui.menu:registerToMainMenu(self)
@@ -63,109 +103,61 @@ function BluetoothController:init()
 end
 
 -- =======================================================
---  Plugin Directory Detection
--- =======================================================
-
-function BluetoothController:getPluginDir()
-    local info = debug.getinfo(1, "S")
-    local script_path = info.source:match("@(.+)")
-    if script_path then
-        return script_path:match("(.+)/[^/]+$") or script_path:match("(.+)\\[^\\]+$") or "."
-    end
-    return "."
-end
-
--- =======================================================
 --  Settings Management
 -- =======================================================
 
 function BluetoothController:loadSettings()
-    local file = io.open(self.settings_file, "r")
-    if not file then
-        logger.warn("BT Plugin: Config file not found, using defaults")
-        return
-    end
-
-    local content = file:read("*all")
-    file:close()
-
-    local loader = loadstring(content)
+    local loader = loadfile(self.settings_file)
     if not loader then
-        logger.warn("BT Plugin: Failed to parse config file")
+        logger.warn("BT Plugin: Config file missing or unparsable, using defaults")
         return
     end
 
-    local full_config = loader()
-    if not full_config then return end
+    local ok, full_config = pcall(loader)
+    if not ok or type(full_config) ~= "table" then
+        logger.warn("BT Plugin: Failed to evaluate config file")
+        return
+    end
 
-    -- Load common settings
-    local common = full_config.common or {}
+    self.full_config = full_config
+    self:applyConfig()
+end
+
+-- Apply the in-memory full_config to the active runtime fields (no file I/O)
+function BluetoothController:applyConfig()
+    local common = self.full_config.common or {}
     self.wakeup_delay = common.wakeup_delay or 3
     self.trigger_cooldown_ms = common.trigger_cooldown_ms or 500
     self.active_profile = common.active_profile or "xbox_wireless_controller"
-    self.config.invert_layout = common.invert_layout or false
 
-    -- Load active profile configuration
-    local profile = full_config.profiles and full_config.profiles[self.active_profile]
-    if profile then
-        for k, v in pairs(profile) do
-            self.config[k] = v
-        end
-        self.config.analog_threshold = profile.axis_threshold or profile.analog_threshold or AXIS_THRESHOLD_DEFAULT
-        logger.info("BT Plugin: Loaded profile '" .. (profile.name or self.active_profile) .. "'")
-    else
+    -- 整表重建，避免上一份 profile 的键残留
+    self.config = { invert_layout = common.invert_layout or false }
+    resetInputState()
+
+    local profile = self.full_config.profiles and self.full_config.profiles[self.active_profile]
+    if not profile then
         logger.warn("BT Plugin: Profile '" .. tostring(self.active_profile) .. "' not found in bluetooth.lua")
-    end
-
-    -- Store full config for menu access
-    self.full_config = full_config
-end
-
--- Save full configuration back to file
-function BluetoothController:saveFullConfig()
-    if not self.full_config then return end
-
-    local file = io.open(self.settings_file, "w")
-    if not file then
-        logger.warn("BT Plugin: Failed to open config file for writing")
         return
     end
 
-    -- Recursive serializer with indentation
-    local function serialize(obj, level)
-        level = level or 0
-        local indent = string.rep("    ", level)
-        local next_indent = string.rep("    ", level + 1)
-
-        if type(obj) == "table" then
-            local result = "{\n"
-
-            -- Collect and sort keys
-            local keys = {}
-            for k in pairs(obj) do table.insert(keys, k) end
-            table.sort(keys, function(a, b)
-                return tostring(a) < tostring(b)
-            end)
-
-            for _, k in ipairs(keys) do
-                local v = obj[k]
-                local key_str = type(k) == "number"
-                    and "[" .. k .. "]"
-                    or "[\"" .. tostring(k) .. "\"]"
-
-                result = result .. next_indent .. key_str .. " = " .. serialize(v, level + 1) .. ",\n"
-            end
-            return result .. indent .. "}"
-        elseif type(obj) == "string" then
-            return string.format("%q", obj)
-        else
-            return tostring(obj)
-        end
+    for k, v in pairs(profile) do
+        self.config[k] = v
     end
+    self.config.analog_threshold = profile.axis_threshold or AXIS_THRESHOLD_DEFAULT
+    logger.info("BT Plugin: Loaded profile '" .. (profile.name or self.active_profile) .. "'")
+end
 
-    file:write("return " .. serialize(self.full_config))
-    file:close()
-    logger.info("BT Plugin: Configuration saved")
+-- Save full configuration back to file（写法同 LuaSettings:flush）
+function BluetoothController:saveFullConfig()
+    if not self.full_config then return end
+
+    -- dump(..., ordered=true) 保证键序稳定，配置文件不会每次改动都整体重排
+    local ok, err = util.writeToFile(dump(self.full_config, nil, true), self.settings_file, true, true)
+    if ok then
+        logger.info("BT Plugin: Configuration saved")
+    else
+        logger.warn("BT Plugin: Failed to write config file -> " .. tostring(err))
+    end
 end
 
 function BluetoothController:setCommonSetting(key, value)
@@ -176,12 +168,11 @@ function BluetoothController:setCommonSetting(key, value)
 end
 
 function BluetoothController:setActiveProfileSetting(key, value)
-    if self.full_config and self.full_config.profiles and self.active_profile then
-        local profile = self.full_config.profiles[self.active_profile]
-        if profile then
-            profile[key] = value
-            self:saveFullConfig()
-        end
+    local profiles = self.full_config and self.full_config.profiles
+    local profile = profiles and self.active_profile and profiles[self.active_profile]
+    if profile then
+        profile[key] = value
+        self:saveFullConfig()
     end
 end
 
@@ -194,20 +185,14 @@ function BluetoothController:registerInputHook()
     _current_active_controller = self
 
     -- Only register once per KOReader session (module-level check)
-    if _shared_hook_registered then
-        self._hook_active = true  -- Re-activate if previously disabled
-        return
-    end
+    if _shared_hook_registered then return end
 
-    local hook_func = function(_input_instance, ev)
+    Device.input:registerEventAdjustHook(function(_input_instance, ev)
         local controller = _current_active_controller
-        -- Only process events when hook is active on current controller
-        if controller and controller._hook_active then
+        if controller then
             controller:handleInputEvent(ev)
         end
-    end
-
-    Device.input:registerEventAdjustHook(hook_func)
+    end)
     _shared_hook_registered = true
 end
 
@@ -225,8 +210,8 @@ function BluetoothController:deviceExists(path)
     return false
 end
 
-function BluetoothController:openDevice(path, is_reload)
-    path = path or self.config.device_path
+function BluetoothController:openDevice(is_reload)
+    local path = self.config.device_path
     if not path or path == "" then
         logger.warn("BT Plugin: No device path configured")
         return false
@@ -247,9 +232,7 @@ function BluetoothController:openDevice(path, is_reload)
         return false
     end
 
-    -- Reset shared axis tracking state
-    _shared_axis_values = {}
-    _shared_triggered = false
+    resetInputState()
 
     local success, err = pcall(function() input:open(path) end)
     if success then
@@ -261,96 +244,11 @@ function BluetoothController:openDevice(path, is_reload)
 end
 
 function BluetoothController:ensureConnected()
-    return self:openDevice(self.config.device_path, false)
+    return self:openDevice(false)
 end
 
 function BluetoothController:reloadDevice()
-    return self:openDevice(self.config.device_path, true)
-end
-
--- Scan for JOYSTICK / Bluetooth input devices from sysfs and KOReader registry
-function BluetoothController:scanJoystickDevices()
-    local devices = {}
-    local seen_paths = {}
-
-    -- Known Kindle internal system devices to ignore
-    local system_devices = {
-        ["pt_mt"] = true,
-        ["goodix-ts"] = true,
-        ["bd71828-pwrkey"] = true,
-        ["max77696-onkey"] = true,
-        ["gpio-keys"] = true,
-        ["hall_sensor"] = true,
-        ["accel"] = true,
-    }
-
-    -- Scan sysfs /sys/class/input/event0 .. event15
-    for i = 0, 15 do
-        local dev_path = "/dev/input/event" .. i
-        local sys_name_path = "/sys/class/input/event" .. i .. "/device/name"
-        local name_file = io.open(sys_name_path, "r")
-        if name_file then
-            local raw_name = name_file:read("*line")
-            name_file:close()
-
-            if raw_name and raw_name ~= "" then
-                local clean_name = raw_name:gsub("^%s*(.-)%s*$", "%1")
-                local lower_name = clean_name:lower()
-
-                -- Filter out known Kindle internal hardware devices
-                local is_system = false
-                for sys_name, _ in pairs(system_devices) do
-                    if lower_name:find(sys_name, 1, true) then
-                        is_system = true
-                        break
-                    end
-                end
-
-                if not is_system then
-                    local is_controller = false
-
-                    -- Check 1: Match configured profiles
-                    if self.full_config and self.full_config.profiles then
-                        for _, profile in pairs(self.full_config.profiles) do
-                            if profile.device_path == dev_path then
-                                is_controller = true
-                                break
-                            end
-                        end
-                    end
-
-                    -- Check 2: Match typical Bluetooth/gamepad device name keywords
-                    if not is_controller then
-                        if lower_name:find("controller") or lower_name:find("gamepad") or
-                           lower_name:find("joystick") or lower_name:find("xbox") or
-                           lower_name:find("playstation") or lower_name:find("8bitdo") or
-                           lower_name:find("wireless") or lower_name:find("bluetooth") or
-                           lower_name:find("hid") or lower_name:find("keyboard") then
-                            is_controller = true
-                        end
-                    end
-
-                    -- Check 3: Check if already opened in KOReader
-                    local is_opened = self:isDeviceOpened(dev_path)
-                    if is_opened then
-                        is_controller = true
-                    end
-
-                    if is_controller and not seen_paths[dev_path] then
-                        seen_paths[dev_path] = true
-                        table.insert(devices, {
-                            path = dev_path,
-                            name = clean_name,
-                            opened = is_opened,
-                        })
-                        logger.info("BT Plugin: Found input device: " .. clean_name .. " at " .. dev_path .. " (opened=" .. tostring(is_opened) .. ")")
-                    end
-                end
-            end
-        end
-    end
-
-    return devices
+    return self:openDevice(true)
 end
 
 -- Check if a device is currently opened
@@ -362,43 +260,105 @@ function BluetoothController:isDeviceOpened(path)
     return false
 end
 
+-- Whether any configured profile claims this device node
+function BluetoothController:isProfilePath(path)
+    local profiles = self.full_config and self.full_config.profiles
+    if not profiles then return false end
+    for _id, profile in pairs(profiles) do
+        if profile.device_path == path then return true end
+    end
+    return false
+end
+
+-- Scan for JOYSTICK / Bluetooth input devices from sysfs and KOReader registry
+function BluetoothController:scanJoystickDevices()
+    local devices = {}
+
+    -- Scan sysfs /sys/class/input/event0 .. event15
+    for i = 0, 15 do
+        local name_file = io.open("/sys/class/input/event" .. i .. "/device/name", "r")
+        if name_file then
+            local raw_name = name_file:read("*line")
+            name_file:close()
+
+            local clean_name = raw_name and util.trim(raw_name)
+            if clean_name and clean_name ~= "" then
+                local dev_path = "/dev/input/event" .. i
+                local lower_name = clean_name:lower()
+                local is_opened = self:isDeviceOpened(dev_path)
+
+                -- 排除 Kindle 内部硬件；其余只要已打开、被配置引用或名字像手柄就列出
+                if not nameMatches(lower_name, SYSTEM_DEVICE_NAMES)
+                    and (is_opened
+                         or nameMatches(lower_name, CONTROLLER_KEYWORDS)
+                         or self:isProfilePath(dev_path)) then
+                    table.insert(devices, {
+                        path = dev_path,
+                        name = clean_name,
+                        opened = is_opened,
+                    })
+                    logger.info("BT Plugin: Found input device: " .. clean_name .. " at " .. dev_path .. " (opened=" .. tostring(is_opened) .. ")")
+                end
+            end
+        end
+    end
+
+    return devices
+end
+
 -- =======================================================
 --  Hardware State Management
 -- =======================================================
 
+-- KindlePowerD 已经持有一个进程内 lipc 句柄；用它可以省掉 fork + exec 一个 lipc-*-prop
+local function btLipc()
+    local powerd = Device:getPowerDevice()
+    return powerd and powerd.lipc_handle
+end
+
+-- Query Bluetooth radio state (BTstate: 0=off, >0=on)
 function BluetoothController:getRealState()
-    local success, output = pcall(function()
-        -- Query Bluetooth radio state (BTstate: 0=off, >0=on)
-        local pipe = io.popen("lipc-get-prop com.lab126.btfd BTstate")
-        if not pipe then return nil end
-        local result = pipe:read("*all")
-        pipe:close()
-        return result
-    end)
+    local lipc = btLipc()
+    if lipc then
+        local ok, state = pcall(lipc.get_int_property, lipc, "com.lab126.btfd", "BTstate")
+        if ok then return (tonumber(state) or 0) > 0 end
+    end
 
-    if not success or not output then return false end
-
+    local pipe = io.popen("lipc-get-prop com.lab126.btfd BTstate")
+    if not pipe then return false end
+    local output = pipe:read("*all")
+    pipe:close()
     return (tonumber(output) or 0) > 0
 end
 
--- Returns cached state if within debounce window, otherwise queries hardware
+-- 菜单 checked_func 每次重绘都会调用，而 getRealState 要 fork 一个进程，故缓存
 function BluetoothController:getDisplayState()
-    local elapsed = os.time() - self.last_action_time
-    if elapsed < 2 then
-        return self.target_state
+    if os.time() - self._state_time < STATE_CACHE_INTERVAL then
+        return self._state_cached
     end
-    return self:getRealState()
+    self:cacheState(self:getRealState())
+    return self._state_cached
+end
+
+function BluetoothController:cacheState(state)
+    self._state_cached = state
+    self._state_time = os.time()
 end
 
 function BluetoothController:setBluetoothState(enable)
     local val = enable and 0 or 1  -- BTflightMode: 0 = BT on, 1 = BT off
-    local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
-    local exit_code = os.execute(cmd)
+    local lipc = btLipc()
+    local done = lipc and pcall(lipc.set_int_property, lipc, "com.lab126.btfd", "BTflightMode", val)
 
-    if exit_code ~= 0 then
-        logger.warn("BT Plugin: Failed to execute: " .. cmd .. " (exit code: " .. tostring(exit_code) .. ")")
+    if not done then
+        local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
+        local exit_code = os.execute(cmd)
+        if exit_code ~= 0 then
+            logger.warn("BT Plugin: Failed to execute: " .. cmd .. " (exit code: " .. tostring(exit_code) .. ")")
+        end
     end
 
+    self:cacheState(enable)
     local msg = enable and _("Bluetooth enabled") or _("Bluetooth disabled")
     UIManager:show(InfoMessage:new { text = msg, timeout = 2 })
 end
@@ -416,6 +376,12 @@ end
 --  System Event Handlers
 -- =======================================================
 
+-- 对应 onDispatcherRegisterActions 注册的 "ToggleBluetooth"（原先注册了但没有处理函数）
+function BluetoothController:onToggleBluetooth()
+    self:setBluetoothState(not self:getDisplayState())
+    return true
+end
+
 function BluetoothController:onOutOfScreenSaver()
     logger.info("BT Plugin: Device wakeup detected, scheduling reload...")
     if self._wakeup_task then
@@ -423,16 +389,10 @@ function BluetoothController:onOutOfScreenSaver()
         self._wakeup_task = nil
     end
 
-    local delay = self.wakeup_delay or 3
-    self._wakeup_task = UIManager:scheduleIn(delay, function()
+    self._wakeup_task = UIManager:scheduleIn(self.wakeup_delay, function()
         self._wakeup_task = nil
-        if self:deviceExists(self.config.device_path) then
-            logger.info("BT Plugin: Wakeup - Device found, reloading...")
-            if self:reloadDevice() then
-                UIManager:show(InfoMessage:new{ text = _("BT Controller Reconnected"), timeout = 2 })
-            end
-        else
-            logger.info("BT Plugin: Wakeup - Device not found, skipping reload")
+        if self:reloadDevice() then
+            UIManager:show(InfoMessage:new{ text = _("BT Controller Reconnected"), timeout = 2 })
         end
     end)
 end
@@ -454,13 +414,14 @@ function BluetoothController:pokeActivity()
 end
 
 function BluetoothController:handleInputEvent(ev)
-    -- Ignore all events if bluetooth controller device is not currently opened
-    if not self:isDeviceOpened(self.config.device_path) then
+    -- 这个 hook 会收到所有输入设备的事件，先用最便宜的整数比较筛掉多点触控
+    -- (ABS_MT_* codes >= 47: ABS_MT_POSITION_X=53, ABS_MT_POSITION_Y=54, etc.)
+    if ev.type == C.EV_ABS and ev.code >= ABS_MT_FIRST then
         return
     end
 
-    -- Ignore multi-touch ABS events (ABS_MT_* codes >= 47: ABS_MT_POSITION_X=53, ABS_MT_POSITION_Y=54, etc.)
-    if ev.type == C.EV_ABS and ev.code >= 47 then
+    -- Ignore all events if bluetooth controller device is not currently opened
+    if not self:isDeviceOpened(self.config.device_path) then
         return
     end
 
@@ -510,7 +471,7 @@ function BluetoothController:parseAnalogInput(ev)
     local mapping = self.config.analog_map[ev.code]
     if not mapping then return nil end
 
-    local center = self:getAxisCenter(ev.code)
+    local center = (self.config.analog_center or {})[ev.code] or AXIS_CENTER_DEFAULT
     local threshold = self.config.analog_threshold or AXIS_THRESHOLD_DEFAULT
     local deviation = math.abs(ev.value - center)
 
@@ -538,20 +499,14 @@ function BluetoothController:parseAnalogInput(ev)
     if _shared_triggered then return nil end
 
     -- Time-based debouncing: check cooldown
-    local now = time:now()
-    local now_ms = time.to_ms(now)
-
-    if _shared_last_trigger_time then
-        local last_ms = time.to_ms(_shared_last_trigger_time)
-        local cooldown_ms = (self.trigger_cooldown_ms or 500)
-        if (now_ms - last_ms) < cooldown_ms then
-            return nil
-        end
+    if _shared_last_trigger_time
+        and time.since(_shared_last_trigger_time) < time.ms(self.trigger_cooldown_ms) then
+        return nil
     end
 
     -- Trigger action
     _shared_triggered = true
-    _shared_last_trigger_time = now
+    _shared_last_trigger_time = time.now()
 
     if ev.value < center then
         return mapping.low_dir
@@ -560,24 +515,12 @@ function BluetoothController:parseAnalogInput(ev)
     end
 end
 
--- Get center value for an axis (supports per-axis calibration)
-function BluetoothController:getAxisCenter(axis_code)
-    local centers = self.config.analog_center
-    if centers and centers[axis_code] then
-        return centers[axis_code]
-    end
-    return AXIS_CENTER_DEFAULT
-end
-
 -- =======================================================
 --  Bluetooth Dump File Cleanup
 -- =======================================================
 
 function BluetoothController:cleanupBluetoothDumps()
-    local cmd = "rm -rf /mnt/us/audiomgrd_*.core /mnt/us/btmanagerd_*.core /mnt/us/Indexer_Dump_*.txt " ..
-                "/mnt/us/documents/audiomgrd_*_crash_* /mnt/us/documents/btmanagerd_*_crash_* " ..
-                "/mnt/us/documents/*btmanagerd*.sdr /mnt/us/documents/*audiomgrd*.sdr 2>/dev/null"
-    os.execute(cmd)
+    os.execute("rm -rf " .. table.concat(DUMP_PATTERNS, " ") .. " 2>/dev/null")
     logger.info("BT Plugin: Cleaned up bluetooth dump files")
 end
 
@@ -585,7 +528,34 @@ end
 --  Menu Interface
 -- =======================================================
 
+-- 设备状态 → (标签, 说明)，索引为 [是否当前配置][是否已在 KOReader 打开]
+local DEVICE_STATUS = {
+    [true] = {
+        [true]  = { _(" [当前]"),   _("已连接并在 KOReader 中打开") },
+        [false] = { _(" [已配置]"), _("已配置为此设备（未打开）") },
+    },
+    [false] = {
+        [true]  = { _(" [已连接]"), _("已在 KOReader 中打开") },
+        [false] = { _(" [可用]"),   _("系统蓝牙已连接（可配置使用）") },
+    },
+}
+
 function BluetoothController:addToMainMenu(menu_items)
+    -- 「模拟摇杆」/「方向键」只差一个布尔值
+    local function joystickModeItem(text, analog)
+        return {
+            text = text,
+            checked_func = function()
+                return (self.config.use_analog_mode == true) == analog
+            end,
+            callback = function()
+                self.config.use_analog_mode = analog
+                resetInputState()
+                self:setActiveProfileSetting("use_analog_mode", analog)
+            end,
+        }
+    end
+
     local sub_items = {}
 
     -- 1. Bluetooth Toggle
@@ -594,11 +564,8 @@ function BluetoothController:addToMainMenu(menu_items)
         keep_menu_open = true,
         checked_func = function() return self:getDisplayState() end,
         callback = function(touchmenu_instance)
-            local next_state = not self:getDisplayState()
-            self.target_state = next_state
-            self.last_action_time = os.time()
+            self:setBluetoothState(not self:getDisplayState())
             touchmenu_instance:updateItems()
-            self:setBluetoothState(next_state)
         end,
     })
 
@@ -608,53 +575,30 @@ function BluetoothController:addToMainMenu(menu_items)
         keep_menu_open = true,
         sub_item_table_func = function()
             local devices = self:scanJoystickDevices()
-            local current_device = self.config.device_path
-            local items = {}
-
             if #devices == 0 then
-                table.insert(items, {
+                return { {
                     text = _("未发现蓝牙手柄"),
                     enabled_func = function() return false end,
-                })
-            else
-                for _, dev in ipairs(devices) do
-                    local is_current = (dev.path == current_device)
-                    local status_tag = ""
-                    local status_desc = ""
-
-                    if is_current then
-                        if dev.opened then
-                            status_tag = _(" [当前]")
-                            status_desc = _("已连接并在 KOReader 中打开")
-                        else
-                            status_tag = _(" [已配置]")
-                            status_desc = _("已配置为此设备（未打开）")
-                        end
-                    else
-                        if dev.opened then
-                            status_tag = _(" [已连接]")
-                            status_desc = _("已在 KOReader 中打开")
-                        else
-                            status_tag = _(" [可用]")
-                            status_desc = _("系统蓝牙已连接（可配置使用）")
-                        end
-                    end
-
-                    table.insert(items, {
-                        text = dev.name .. status_tag,
-                        callback = function()
-                            local detail_msg = string.format(
-                                _("设备名称: %s\n设备节点: %s\n连接状态: %s"),
-                                dev.name,
-                                dev.path,
-                                status_desc
-                            )
-                            UIManager:show(InfoMessage:new{ text = detail_msg, timeout = 4 })
-                        end,
-                    })
-                end
+                } }
             end
 
+            local items = {}
+            for _i, dev in ipairs(devices) do
+                local is_current = (dev.path == self.config.device_path)
+                local status_tag, status_desc = unpack(DEVICE_STATUS[is_current][dev.opened])
+
+                table.insert(items, {
+                    text = dev.name .. status_tag,
+                    callback = function()
+                        UIManager:show(InfoMessage:new{
+                            text = string.format(
+                                _("设备名称: %s\n设备节点: %s\n连接状态: %s"),
+                                dev.name, dev.path, status_desc),
+                            timeout = 4,
+                        })
+                    end,
+                })
+            end
             return items
         end,
     })
@@ -666,32 +610,23 @@ function BluetoothController:addToMainMenu(menu_items)
         sub_item_table_func = function()
             local profiles = {}
 
-            if self.full_config and self.full_config.profiles then
-                for profile_id, profile in pairs(self.full_config.profiles) do
-                    table.insert(profiles, {
-                        text = profile.name or profile_id,
-                        checked_func = function()
-                            return self.active_profile == profile_id
-                        end,
-                        callback = function()
-                            self.active_profile = profile_id
-                            self:setCommonSetting("active_profile", profile_id)
-
-                            self:loadSettings()
-                            if self:reloadDevice() then
-                                UIManager:show(InfoMessage:new{
-                                    text = _("已切换到 ") .. (profile.name or profile_id),
-                                    timeout = 2
-                                })
-                            else
-                                UIManager:show(InfoMessage:new{
-                                    text = _("配置已切换，但未找到设备"),
-                                    timeout = 2
-                                })
-                            end
-                        end,
-                    })
-                end
+            for profile_id, profile in pairs((self.full_config or {}).profiles or {}) do
+                table.insert(profiles, {
+                    text = profile.name or profile_id,
+                    checked_func = function()
+                        return self.active_profile == profile_id
+                    end,
+                    callback = function()
+                        self:setCommonSetting("active_profile", profile_id)
+                        self:applyConfig()
+                        UIManager:show(InfoMessage:new{
+                            text = self:reloadDevice()
+                                and _("已切换到 ") .. (profile.name or profile_id)
+                                or _("配置已切换，但未找到设备"),
+                            timeout = 2,
+                        })
+                    end,
+                })
             end
 
             return profiles
@@ -715,23 +650,8 @@ function BluetoothController:addToMainMenu(menu_items)
             return self.config.supports_dpad == true
         end,
         sub_item_table = {
-            {
-                text = _("模拟摇杆"),
-                checked_func = function() return self.config.use_analog_mode end,
-                callback = function()
-                    self.config.use_analog_mode = true
-                    _shared_triggered = false
-                    self:setActiveProfileSetting("use_analog_mode", true)
-                end
-            },
-            {
-                text = _("方向键"),
-                checked_func = function() return not self.config.use_analog_mode end,
-                callback = function()
-                    self.config.use_analog_mode = false
-                    self:setActiveProfileSetting("use_analog_mode", false)
-                end
-            }
+            joystickModeItem(_("模拟摇杆"), true),
+            joystickModeItem(_("方向键"), false),
         }
     })
 
@@ -740,10 +660,10 @@ function BluetoothController:addToMainMenu(menu_items)
         text = _("唤醒延迟"),
         keep_menu_open = true,
         callback = function()
-            local current_delay = self.wakeup_delay or 3
+            local SpinWidget = require("ui/widget/spinwidget")
             UIManager:show(SpinWidget:new{
                 title_text = _("设置唤醒延迟（秒）"),
-                value = current_delay,
+                value = self.wakeup_delay,
                 value_min = 1,
                 value_max = 10,
                 value_step = 1,
@@ -762,16 +682,15 @@ function BluetoothController:addToMainMenu(menu_items)
         end,
     })
 
-    -- 7. Reload device
+    -- 7. Reload device (也重读配置文件，方便手工编辑 bluetooth.lua 后生效)
     table.insert(sub_items, {
         text = _("重新加载设备"),
         callback = function()
             self:loadSettings()
-            if self:reloadDevice() then
-                UIManager:show(InfoMessage:new{ text = _("设备已加载"), timeout = 2 })
-            else
-                UIManager:show(InfoMessage:new{ text = _("加载失败"), timeout = 2 })
-            end
+            UIManager:show(InfoMessage:new{
+                text = self:reloadDevice() and _("设备已加载") or _("加载失败"),
+                timeout = 2,
+            })
         end
     })
 
@@ -798,6 +717,10 @@ function BluetoothController:onExit()
     if self._wakeup_task then
         UIManager:unschedule(self._wakeup_task)
         self._wakeup_task = nil
+    end
+    -- 松开模块级强引用，否则整棵 ReaderUI 会跟着这个实例一起活到进程退出
+    if _current_active_controller == self then
+        _current_active_controller = nil
     end
     return true
 end
