@@ -24,7 +24,7 @@ local ABS_MT_FIRST = 47          -- ABS_MT_SLOT，其后均为多点触控轴
 -- Kindle 内部输入设备（永不当作手柄）
 local SYSTEM_DEVICE_NAMES = {
     "pt_mt", "goodix-ts", "bd71828-pwrkey", "max77696-onkey",
-    "gpio-keys", "hall_sensor", "accel",
+    "gpio-keys", "hall_sensor", "accel", "bma4xy_feature", "stylus-custom",
 }
 
 -- 典型蓝牙手柄/键盘的设备名关键词
