@@ -18,6 +18,7 @@ local AXIS_CENTER_DEFAULT = 32768
 local AXIS_THRESHOLD_DEFAULT = 16384
 local POWER_RESET_INTERVAL = 60  -- 系统休眠计时器重置间隔（秒）
 local STATE_CACHE_INTERVAL = 2   -- 蓝牙开关状态缓存时长（秒）
+local DEFAULT_PROFILE = "xbox_wireless_controller"
 local ABS_MT_FIRST = 47          -- ABS_MT_SLOT，其后均为多点触控轴
 
 -- Kindle 内部输入设备（永不当作手柄）
@@ -77,7 +78,7 @@ local BluetoothController = WidgetContainer:extend {
     settings_file = nil,  -- Dynamically set in init()
     _config_loaded = false,  -- 配置文件读成功过才允许回写，见 saveFullConfig
 
-    -- 配置文件缺失时仍需可用的默认值
+    -- 默认值的唯一归宿（applyConfig 只在配置里有值时覆盖）
     wakeup_delay = 3,
     trigger_cooldown_ms = 500,
 
@@ -92,8 +93,7 @@ local BluetoothController = WidgetContainer:extend {
 function BluetoothController:init()
     if not Device:isKindle() then return end
 
-    -- 立刻换成实例自己的表：类表上的 config/full_config 是所有实例共享的，
-    -- 若 loadSettings 提前失败（applyConfig 不会跑），菜单回调就会写进类原型
+    -- 用实例表，别写进类原型（loadSettings 失败时 applyConfig 不会跑）
     self.config = {}
     self.full_config = {}
 
@@ -108,7 +108,7 @@ function BluetoothController:init()
     self:registerInputHook()
 
     -- Attempt initial device connection
-    self:ensureConnected()
+    self:openDevice(false)
 end
 
 -- =======================================================
@@ -135,10 +135,11 @@ end
 
 -- Apply the in-memory full_config to the active runtime fields (no file I/O)
 function BluetoothController:applyConfig()
+    -- 默认值只有类表上那一份（见 wakeup_delay / trigger_cooldown_ms）
     local common = self.full_config.common or {}
-    self.wakeup_delay = common.wakeup_delay or 3
-    self.trigger_cooldown_ms = common.trigger_cooldown_ms or 500
-    self.active_profile = common.active_profile or "xbox_wireless_controller"
+    self.wakeup_delay = common.wakeup_delay or self.wakeup_delay
+    self.trigger_cooldown_ms = common.trigger_cooldown_ms or self.trigger_cooldown_ms
+    self.active_profile = common.active_profile or DEFAULT_PROFILE
 
     -- 整表重建，避免上一份 profile 的键残留
     self.config = { invert_layout = common.invert_layout or false }
@@ -213,10 +214,7 @@ function BluetoothController:registerInputHook()
     if _shared_hook_registered then return end
 
     Device.input:registerEventAdjustHook(function(_input_instance, ev)
-        local controller = _current_active_controller
-        if controller then
-            controller:handleInputEvent(ev)
-        end
+        if _current_active_controller then _current_active_controller:handleInputEvent(ev) end
     end)
     _shared_hook_registered = true
 end
@@ -226,13 +224,7 @@ end
 -- =======================================================
 
 function BluetoothController:deviceExists(path)
-    if not path or path == "" then return false end
-    local file = io.open(path, "r")
-    if file then
-        file:close()
-        return true
-    end
-    return false
+    return path ~= nil and path ~= "" and lfs.attributes(path, "mode") ~= nil
 end
 
 function BluetoothController:openDevice(is_reload)
@@ -242,17 +234,13 @@ function BluetoothController:openDevice(is_reload)
         return false
     end
 
-    local input = Device.input
-    if not input then return false end
-
     if self:isDeviceOpened(path) then
         if not is_reload then return true end
         -- 必须先关：节点已消失时若保留 fd，isDeviceOpened 会永远为真，
         -- handleInputEvent 的闸门就一直开着，去拦截并吞掉其它设备的事件（不重启无法恢复）。
         -- 代价是唤醒瞬间 open 偶发失败会丢掉一个本来还在工作的 fd，
         -- 但那种情况下一次唤醒或「重新加载设备」就能重连，是可恢复的一侧。
-        logger.info("BT Plugin: Reload - closing previous device " .. path)
-        pcall(function() input:close(path) end)
+        self:closeDevice()
     end
 
     if not self:deviceExists(path) then
@@ -262,7 +250,7 @@ function BluetoothController:openDevice(is_reload)
 
     resetInputState()
 
-    local success, err = pcall(function() input:open(path) end)
+    local success, err = pcall(Device.input.open, Device.input, path)
     if success then
         logger.info("BT Plugin: Opened device " .. path)
     else
@@ -276,12 +264,8 @@ function BluetoothController:closeDevice()
     local path = self.config.device_path
     if path and self:isDeviceOpened(path) then
         logger.info("BT Plugin: Closing device " .. path)
-        pcall(function() Device.input:close(path) end)
+        pcall(Device.input.close, Device.input, path)
     end
-end
-
-function BluetoothController:ensureConnected()
-    return self:openDevice(false)
 end
 
 function BluetoothController:reloadDevice()
@@ -290,11 +274,7 @@ end
 
 -- Check if a device is currently opened
 function BluetoothController:isDeviceOpened(path)
-    local input = Device.input
-    if input and input.opened_devices then
-        return input.opened_devices[path] ~= nil
-    end
-    return false
+    return Device.input.opened_devices[path] ~= nil
 end
 
 -- Whether any configured profile claims this device node
@@ -348,18 +328,8 @@ end
 -- =======================================================
 
 -- Query Bluetooth radio state (BTstate: 0=off, >0=on)
--- 优先用 KindlePowerD 持有的进程内 lipc 句柄，省掉 fork + exec 一个 lipc-get-prop。
--- get_int_property 失败时返回 nil 而不抛错（参见 kindle/device.lua:304 的 `or 0`），故须判 state。
+-- io.popen 在内存吃紧的 Kindle 上可能直接抛错，不能让它冒到菜单渲染路径上
 function BluetoothController:getRealState()
-    local powerd = Device:getPowerDevice()
-    local lipc = powerd and powerd.lipc_handle
-    if lipc then
-        local ok, state = pcall(lipc.get_int_property, lipc, "com.lab126.btfd", "BTstate")
-        if ok and state then return (tonumber(state) or 0) > 0 end
-    end
-
-    -- 菜单每次重绘都会走到这里，io.popen 在内存吃紧的 Kindle 上可能直接抛错，
-    -- 不能让它冒到菜单渲染路径上
     local ok, output = pcall(function()
         local pipe = io.popen("lipc-get-prop com.lab126.btfd BTstate")
         if not pipe then return nil end
@@ -375,17 +345,11 @@ function BluetoothController:getDisplayState()
     if self._state_time and time.since(self._state_time) < time.s(STATE_CACHE_INTERVAL) then
         return self._state_cached
     end
-    self:cacheState(self:getRealState())
+    self._state_cached = self:getRealState()
+    self._state_time = time.now()
     return self._state_cached
 end
 
-function BluetoothController:cacheState(state)
-    self._state_cached = state
-    self._state_time = time.now()
-end
-
--- 这里不走 lipc 句柄：set_int_property 在 KOReader 各处都不检查返回值，
--- 没有可靠的成功信号；os.execute 的退出码是我们唯一能据以判断成败的东西。
 function BluetoothController:setBluetoothState(enable)
     local val = enable and 0 or 1  -- BTflightMode: 0 = BT on, 1 = BT off
     local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
@@ -398,7 +362,8 @@ function BluetoothController:setBluetoothState(enable)
         return
     end
 
-    self:cacheState(enable)
+    self._state_cached = enable
+    self._state_time = time.now()
     local msg = enable and _("Bluetooth enabled") or _("Bluetooth disabled")
     UIManager:show(InfoMessage:new { text = msg, timeout = 2 })
 end
