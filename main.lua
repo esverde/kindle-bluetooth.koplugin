@@ -72,6 +72,7 @@ local BluetoothController = WidgetContainer:extend {
     config = {},
     full_config = {},
     settings_file = nil,  -- Dynamically set in init()
+    _config_loaded = false,  -- 配置文件读成功过才允许回写，见 saveFullConfig
 
     -- 配置文件缺失时仍需可用的默认值
     wakeup_delay = 3,
@@ -120,6 +121,7 @@ function BluetoothController:loadSettings()
     end
 
     self.full_config = full_config
+    self._config_loaded = true
     self:applyConfig()
 end
 
@@ -143,13 +145,18 @@ function BluetoothController:applyConfig()
     for k, v in pairs(profile) do
         self.config[k] = v
     end
-    self.config.analog_threshold = profile.axis_threshold or AXIS_THRESHOLD_DEFAULT
+    -- 两种键名拼写都受支持（手工编辑过的配置可能用的是 analog_threshold）
+    self.config.analog_threshold = profile.axis_threshold or profile.analog_threshold or AXIS_THRESHOLD_DEFAULT
     logger.info("BT Plugin: Loaded profile '" .. (profile.name or self.active_profile) .. "'")
 end
 
 -- Save full configuration back to file（写法同 LuaSettings:flush）
 function BluetoothController:saveFullConfig()
-    if not self.full_config then return end
+    -- 从没成功读到过配置时绝不回写：否则一次菜单操作就会把整份 profiles 覆盖成 {common={...}}
+    if not self._config_loaded then
+        logger.warn("BT Plugin: Refusing to overwrite config file that was never loaded successfully")
+        return
+    end
 
     -- dump(..., ordered=true) 保证键序稳定，配置文件不会每次改动都整体重排
     local ok, err = util.writeToFile(dump(self.full_config, nil, true), self.settings_file, true, true)
@@ -220,16 +227,19 @@ function BluetoothController:openDevice(is_reload)
     local input = Device.input
     if not input then return false end
 
-    -- Close first if already opened and this is a reload
-    if self:isDeviceOpened(path) then
-        if not is_reload then return true end
-        logger.info("BT Plugin: Reload - closing previous device " .. path)
-        pcall(function() input:close(path) end)
-    end
+    local already_opened = self:isDeviceOpened(path)
+    if already_opened and not is_reload then return true end
 
+    -- 先确认节点存在再关闭旧的：刚唤醒时节点可能还没重建好，
+    -- 若先关后发现打不开，就白丢了一个本来还在工作的 fd。
     if not self:deviceExists(path) then
         logger.info("BT Plugin: Device " .. path .. " not found")
         return false
+    end
+
+    if already_opened then
+        logger.info("BT Plugin: Reload - closing previous device " .. path)
+        pcall(function() input:close(path) end)
     end
 
     resetInputState()
@@ -310,18 +320,15 @@ end
 --  Hardware State Management
 -- =======================================================
 
--- KindlePowerD 已经持有一个进程内 lipc 句柄；用它可以省掉 fork + exec 一个 lipc-*-prop
-local function btLipc()
-    local powerd = Device:getPowerDevice()
-    return powerd and powerd.lipc_handle
-end
-
 -- Query Bluetooth radio state (BTstate: 0=off, >0=on)
+-- 优先用 KindlePowerD 持有的进程内 lipc 句柄，省掉 fork + exec 一个 lipc-get-prop。
+-- get_int_property 失败时返回 nil 而不抛错（参见 kindle/device.lua:304 的 `or 0`），故须判 state。
 function BluetoothController:getRealState()
-    local lipc = btLipc()
+    local powerd = Device:getPowerDevice()
+    local lipc = powerd and powerd.lipc_handle
     if lipc then
         local ok, state = pcall(lipc.get_int_property, lipc, "com.lab126.btfd", "BTstate")
-        if ok then return (tonumber(state) or 0) > 0 end
+        if ok and state then return (tonumber(state) or 0) > 0 end
     end
 
     local pipe = io.popen("lipc-get-prop com.lab126.btfd BTstate")
@@ -345,17 +352,18 @@ function BluetoothController:cacheState(state)
     self._state_time = os.time()
 end
 
+-- 这里不走 lipc 句柄：set_int_property 在 KOReader 各处都不检查返回值，
+-- 没有可靠的成功信号；os.execute 的退出码是我们唯一能据以判断成败的东西。
 function BluetoothController:setBluetoothState(enable)
     local val = enable and 0 or 1  -- BTflightMode: 0 = BT on, 1 = BT off
-    local lipc = btLipc()
-    local done = lipc and pcall(lipc.set_int_property, lipc, "com.lab126.btfd", "BTflightMode", val)
+    local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
+    local exit_code = os.execute(cmd)
 
-    if not done then
-        local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
-        local exit_code = os.execute(cmd)
-        if exit_code ~= 0 then
-            logger.warn("BT Plugin: Failed to execute: " .. cmd .. " (exit code: " .. tostring(exit_code) .. ")")
-        end
+    if exit_code ~= 0 then
+        logger.warn("BT Plugin: Failed to execute: " .. cmd .. " (exit code: " .. tostring(exit_code) .. ")")
+        -- 不缓存未生效的状态，否则接下来 2 秒内菜单会显示硬件从未进入的状态
+        UIManager:show(InfoMessage:new { text = _("蓝牙切换失败"), timeout = 2 })
+        return
     end
 
     self:cacheState(enable)
@@ -389,12 +397,16 @@ function BluetoothController:onOutOfScreenSaver()
         self._wakeup_task = nil
     end
 
-    self._wakeup_task = UIManager:scheduleIn(self.wakeup_delay, function()
-        self._wakeup_task = nil
+    -- UIManager:scheduleIn 不返回句柄（uimanager.lua:335），unschedule 要的是同一个函数本身
+    local task
+    task = function()
+        if self._wakeup_task == task then self._wakeup_task = nil end
         if self:reloadDevice() then
             UIManager:show(InfoMessage:new{ text = _("BT Controller Reconnected"), timeout = 2 })
         end
-    end)
+    end
+    self._wakeup_task = task
+    UIManager:scheduleIn(self.wakeup_delay, task)
 end
 
 -- =======================================================
@@ -529,14 +541,15 @@ end
 -- =======================================================
 
 -- 设备状态 → (标签, 说明)，索引为 [是否当前配置][是否已在 KOReader 打开]
+-- 这里存原文，_() 在使用处调用：模块只加载一次，在此翻译会把语言冻结在加载时刻
 local DEVICE_STATUS = {
     [true] = {
-        [true]  = { _(" [当前]"),   _("已连接并在 KOReader 中打开") },
-        [false] = { _(" [已配置]"), _("已配置为此设备（未打开）") },
+        [true]  = { " [当前]",   "已连接并在 KOReader 中打开" },
+        [false] = { " [已配置]", "已配置为此设备（未打开）" },
     },
     [false] = {
-        [true]  = { _(" [已连接]"), _("已在 KOReader 中打开") },
-        [false] = { _(" [可用]"),   _("系统蓝牙已连接（可配置使用）") },
+        [true]  = { " [已连接]", "已在 KOReader 中打开" },
+        [false] = { " [可用]",   "系统蓝牙已连接（可配置使用）" },
     },
 }
 
@@ -586,6 +599,7 @@ function BluetoothController:addToMainMenu(menu_items)
             for _i, dev in ipairs(devices) do
                 local is_current = (dev.path == self.config.device_path)
                 local status_tag, status_desc = unpack(DEVICE_STATUS[is_current][dev.opened])
+                status_tag, status_desc = _(status_tag), _(status_desc)
 
                 table.insert(items, {
                     text = dev.name .. status_tag,
