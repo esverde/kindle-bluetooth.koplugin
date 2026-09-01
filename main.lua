@@ -422,10 +422,8 @@ function BluetoothController:pokeActivity()
     end
 end
 
--- ponytail: registerEventAdjustHook 只递交裸的 input_event（input.lua:1684），不带来源设备，
--- 所以"这个事件是不是手柄发的"无法真正判断，只能靠 isDeviceOpened + 映射表近似。
--- 后果：单点触控屏（非 protocol B，ABS_X=0/ABS_Y=1）会撞上 analog_map 的轴号，
--- 造成误翻页且吞掉触摸。要根治得让 KOReader 在事件上带 fd/设备标识。
+-- KOReader 的原生输入后端会在每个事件上附带来源 fd；只处理当前配置的手柄 fd，
+-- 避免把触控、手写笔、旋转传感器和 fake_events 的事件套用到手柄映射。
 function BluetoothController:handleInputEvent(ev)
     -- 这个 hook 会收到所有输入设备的事件，先用最便宜的整数比较筛掉多点触控
     -- (ABS_MT_* codes >= 47: ABS_MT_POSITION_X=53, ABS_MT_POSITION_Y=54, etc.)
@@ -433,8 +431,8 @@ function BluetoothController:handleInputEvent(ev)
         return
     end
 
-    -- Ignore all events if bluetooth controller device is not currently opened
-    if not self:isDeviceOpened(self.config.device_path) then
+    local controller_fd = Device.input.opened_devices[self.config.device_path]
+    if not controller_fd or ev.fd ~= controller_fd then
         return
     end
 
