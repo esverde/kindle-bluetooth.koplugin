@@ -6,6 +6,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
 local Event = require("ui/event")
 local dump = require("dump")
+local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local time = require("ui/time")
 local util = require("util")
@@ -44,8 +45,10 @@ local DUMP_PATTERNS = {
 
 -- MODULE-LEVEL shared state (persists across all instances)
 -- This is critical because KOReader may create multiple plugin instances
+-- 所有节流用的时间都走 time.now()（单调钟）：Kindle 唤醒后会联网对时，
+-- os.time() 往回跳会让"距上次多久"变成负数，把节流窗口永久冻住。
 local _shared_last_trigger_time = nil      -- Time of last page turn (time_fts)
-local _shared_last_power_reset_time = 0    -- Timestamp of last screensaver timer reset
+local _shared_last_power_reset_time = nil   -- Time of last screensaver timer reset (time_fts)
 local _shared_hook_registered = false      -- Whether hook has been registered
 local _shared_triggered = false            -- Whether joystick has triggered (must return to center to reset)
 local _shared_axis_values = {}             -- Track all axis values for all-axes-centered check
@@ -80,7 +83,7 @@ local BluetoothController = WidgetContainer:extend {
 
     -- Cached hardware state (see getDisplayState)
     _state_cached = false,
-    _state_time = 0,
+    _state_time = nil,
 
     -- Wakeup reconnect task handle
     _wakeup_task = nil,
@@ -88,6 +91,11 @@ local BluetoothController = WidgetContainer:extend {
 
 function BluetoothController:init()
     if not Device:isKindle() then return end
+
+    -- 立刻换成实例自己的表：类表上的 config/full_config 是所有实例共享的，
+    -- 若 loadSettings 提前失败（applyConfig 不会跑），菜单回调就会写进类原型
+    self.config = {}
+    self.full_config = {}
 
     -- self.path 由 PluginLoader 注入（pluginloader.lua: plugin_module.path = plugin_root）
     self.settings_file = self.path .. "/bluetooth.lua"
@@ -158,8 +166,18 @@ function BluetoothController:saveFullConfig()
         return
     end
 
+    -- 这份文件是用户手工维护的（注释会被 dump 抹掉），先留一份 .old 备份。
+    -- 同 LuaSettings:backup：只在文件 60 秒内没被改过时才备份，避免刚写的内容被自己覆盖掉备份。
+    local directory_updated
+    if lfs.attributes(self.settings_file, "mode") == "file"
+        and lfs.attributes(self.settings_file, "modification") < os.time() - 60 then
+        os.rename(self.settings_file, self.settings_file .. ".old")
+        directory_updated = true
+    end
+
     -- dump(..., ordered=true) 保证键序稳定，配置文件不会每次改动都整体重排
-    local ok, err = util.writeToFile(dump(self.full_config, nil, true), self.settings_file, true, true)
+    local ok, err = util.writeToFile(dump(self.full_config, nil, true), self.settings_file,
+                                     true, true, directory_updated)
     if ok then
         logger.info("BT Plugin: Configuration saved")
     else
@@ -227,19 +245,19 @@ function BluetoothController:openDevice(is_reload)
     local input = Device.input
     if not input then return false end
 
-    local already_opened = self:isDeviceOpened(path)
-    if already_opened and not is_reload then return true end
+    if self:isDeviceOpened(path) then
+        if not is_reload then return true end
+        -- 必须先关：节点已消失时若保留 fd，isDeviceOpened 会永远为真，
+        -- handleInputEvent 的闸门就一直开着，去拦截并吞掉其它设备的事件（不重启无法恢复）。
+        -- 代价是唤醒瞬间 open 偶发失败会丢掉一个本来还在工作的 fd，
+        -- 但那种情况下一次唤醒或「重新加载设备」就能重连，是可恢复的一侧。
+        logger.info("BT Plugin: Reload - closing previous device " .. path)
+        pcall(function() input:close(path) end)
+    end
 
-    -- 先确认节点存在再关闭旧的：刚唤醒时节点可能还没重建好，
-    -- 若先关后发现打不开，就白丢了一个本来还在工作的 fd。
     if not self:deviceExists(path) then
         logger.info("BT Plugin: Device " .. path .. " not found")
         return false
-    end
-
-    if already_opened then
-        logger.info("BT Plugin: Reload - closing previous device " .. path)
-        pcall(function() input:close(path) end)
     end
 
     resetInputState()
@@ -251,6 +269,15 @@ function BluetoothController:openDevice(is_reload)
         logger.warn("BT Plugin: Failed to open " .. path .. " -> " .. tostring(err))
     end
     return success
+end
+
+-- Close the currently configured device node, if open
+function BluetoothController:closeDevice()
+    local path = self.config.device_path
+    if path and self:isDeviceOpened(path) then
+        logger.info("BT Plugin: Closing device " .. path)
+        pcall(function() Device.input:close(path) end)
+    end
 end
 
 function BluetoothController:ensureConnected()
@@ -331,16 +358,21 @@ function BluetoothController:getRealState()
         if ok and state then return (tonumber(state) or 0) > 0 end
     end
 
-    local pipe = io.popen("lipc-get-prop com.lab126.btfd BTstate")
-    if not pipe then return false end
-    local output = pipe:read("*all")
-    pipe:close()
-    return (tonumber(output) or 0) > 0
+    -- 菜单每次重绘都会走到这里，io.popen 在内存吃紧的 Kindle 上可能直接抛错，
+    -- 不能让它冒到菜单渲染路径上
+    local ok, output = pcall(function()
+        local pipe = io.popen("lipc-get-prop com.lab126.btfd BTstate")
+        if not pipe then return nil end
+        local result = pipe:read("*all")
+        pipe:close()
+        return result
+    end)
+    return ok and (tonumber(output) or 0) > 0
 end
 
 -- 菜单 checked_func 每次重绘都会调用，而 getRealState 要 fork 一个进程，故缓存
 function BluetoothController:getDisplayState()
-    if os.time() - self._state_time < STATE_CACHE_INTERVAL then
+    if self._state_time and time.since(self._state_time) < time.s(STATE_CACHE_INTERVAL) then
         return self._state_cached
     end
     self:cacheState(self:getRealState())
@@ -349,7 +381,7 @@ end
 
 function BluetoothController:cacheState(state)
     self._state_cached = state
-    self._state_time = os.time()
+    self._state_time = time.now()
 end
 
 -- 这里不走 lipc 句柄：set_int_property 在 KOReader 各处都不检查返回值，
@@ -415,9 +447,9 @@ end
 
 -- Reset Kindle system screensaver/sleep countdown (throttled)
 function BluetoothController:pokeActivity()
-    local now = os.time()
-    if (now - _shared_last_power_reset_time) >= POWER_RESET_INTERVAL then
-        _shared_last_power_reset_time = now
+    if not _shared_last_power_reset_time
+        or time.since(_shared_last_power_reset_time) >= time.s(POWER_RESET_INTERVAL) then
+        _shared_last_power_reset_time = time.now()
         local PowerD = Device:getPowerDevice()
         if PowerD and PowerD.resetT1Timeout then
             PowerD:resetT1Timeout()
@@ -425,6 +457,10 @@ function BluetoothController:pokeActivity()
     end
 end
 
+-- ponytail: registerEventAdjustHook 只递交裸的 input_event（input.lua:1684），不带来源设备，
+-- 所以"这个事件是不是手柄发的"无法真正判断，只能靠 isDeviceOpened + 映射表近似。
+-- 后果：单点触控屏（非 protocol B，ABS_X=0/ABS_Y=1）会撞上 analog_map 的轴号，
+-- 造成误翻页且吞掉触摸。要根治得让 KOReader 在事件上带 fd/设备标识。
 function BluetoothController:handleInputEvent(ev)
     -- 这个 hook 会收到所有输入设备的事件，先用最便宜的整数比较筛掉多点触控
     -- (ABS_MT_* codes >= 47: ABS_MT_POSITION_X=53, ABS_MT_POSITION_Y=54, etc.)
@@ -631,6 +667,9 @@ function BluetoothController:addToMainMenu(menu_items)
                         return self.active_profile == profile_id
                     end,
                     callback = function()
+                        -- 换 profile 可能换设备节点：旧节点不关掉，KOReader 会继续轮询它，
+                        -- 而它的事件会被套上新 profile 的映射照样翻页
+                        self:closeDevice()
                         self:setCommonSetting("active_profile", profile_id)
                         self:applyConfig()
                         UIManager:show(InfoMessage:new{
