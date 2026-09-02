@@ -386,14 +386,11 @@ function BluetoothController:getRealState()
         if ok and type(state) == "number" then return state > 0 end
     end
 
-    local ok, output = pcall(function()
-        local pipe = io.popen("lipc-get-prop com.lab126.btfd BTstate")
-        if not pipe then return nil end
-        local result = pipe:read("*all")
-        pipe:close()
-        return result
-    end)
-    return ok and (tonumber(output) or 0) > 0
+    local ok, pipe = pcall(io.popen, "lipc-get-prop com.lab126.btfd BTstate")
+    if not ok or not pipe then return false end
+    local output = pipe:read("*all")
+    pipe:close()
+    return (tonumber(output) or 0) > 0
 end
 
 function BluetoothController:getDisplayState()
@@ -462,10 +459,7 @@ function BluetoothController:pokeActivity()
     if not _shared_last_power_reset_time
         or time.since(_shared_last_power_reset_time) >= time.s(POWER_RESET_INTERVAL) then
         _shared_last_power_reset_time = time.now()
-        local PowerD = Device:getPowerDevice()
-        if PowerD and PowerD.resetT1Timeout then
-            PowerD:resetT1Timeout()
-        end
+        Device:getPowerDevice():resetT1Timeout()
     end
 end
 
