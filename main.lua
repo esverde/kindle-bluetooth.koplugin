@@ -410,7 +410,7 @@ function BluetoothController:setBluetoothState(enable)
 
     self._state_cached = enable
     self._state_time = time.now()
-    local msg = enable and _("Bluetooth enabled") or _("Bluetooth disabled")
+    local msg = enable and _("蓝牙已开启") or _("蓝牙已关闭")
     UIManager:show(InfoMessage:new { text = msg, timeout = 2 })
     return true
 end
@@ -419,7 +419,7 @@ function BluetoothController:onDispatcherRegisterActions()
     Dispatcher:registerAction("toggle_kindle_bluetooth", {
         category = "none",
         event = "ToggleBluetooth",
-        title = _("Toggle Kindle Bluetooth"),
+        title = _("切换 Kindle 蓝牙"),
         general = true
     })
 end
@@ -432,7 +432,7 @@ end
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
     if self:reloadDevice() then
-        UIManager:show(InfoMessage:new{ text = _("BT Controller Reconnected"), timeout = 2 })
+        UIManager:show(InfoMessage:new{ text = _("手柄已重新连接"), timeout = 2 })
     end
 end
 
