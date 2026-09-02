@@ -219,7 +219,7 @@ with an evdev device node… We intentionally don't filter on devpath"。
 早先有一个"唤醒后按 `wakeup_delay` 秒定时重连"的兜底，实测证明它无用且有害：
 
 - 情形 A：手柄没断，那次 close+reopen 纯属浪费，还会弹一个多余的
-  "BT Controller Reconnected" 提示。
+  「手柄已重新连接」提示。
 - 情形 B 周期 1：定时任务在 +3 秒跑，此时节点尚未创建 → 失败，
   并在日志里留下 `[FBInk] [fbink_input_check] open ...: No such file or directory!` 噪音。
 - 情形 B 周期 2：insert 事件在 +1 秒先到，`unschedule` 把定时任务直接取消 → 从未执行。
@@ -481,14 +481,20 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 **每一个菜单项都要点一遍**，别只测主路径 —— 曾有一次崩溃就是因为「清理蓝牙垃圾」
 五轮测试里一次都没被点过：
 
-| 菜单项 | 期待日志 |
-| --- | --- |
-| 蓝牙开关 | 提示"Bluetooth enabled/disabled"；失败则 `Failed to change Bluetooth state` |
-| 已连接设备 | `Found input device: …` |
-| 切换配置 | `Loaded profile '…'` → `Configuration saved` |
-| 反转方向 / 摇杆模式 | `Configuration saved` |
-| 重新加载设备 | `Loaded profile` → `Opened device` |
-| 清理蓝牙垃圾 | `Cleaned up bluetooth dump files` |
+| 菜单项 | 期待日志 | 另外确认 |
+| --- | --- | --- |
+| 蓝牙开关 | 成功时无日志；失败才有 `Failed to change Bluetooth state` | 提示「蓝牙已开启 / 已关闭」 |
+| 已连接设备 | `Found input device: …` | 只列手柄，不含手写笔/触屏 |
+| 切换配置 | `Saved override active_profile` → `Loaded profile '…'` | — |
+| 反转方向 | `Saved override invert_layout` | **重启后仍然反转** |
+| 摇杆模式 → 方向键 | `Saved override analog_mode` | **重启后仍是方向键** |
+| 重新加载设备 | `Loaded profile` → `Closing device` → `Opened device` | — |
+| 清理蓝牙垃圾 | `Cleaned up bluetooth dump files` | — |
+
+「另外确认」里那两个**重启后**是配置拆分（§10）的关键验证点：覆盖值存在
+`<settings>/bluetooth_controller.lua`，读取时若误用 `or` 而非判 `nil`，
+显式的 `false`（方向键模式）就会被 `bluetooth.lua` 里的 `true` 顶掉 ——
+表现正是"选了方向键，重启后变回模拟摇杆"。
 
 功能验证：摇杆推一下能翻页，**且触屏依然正常**（后者验证 fd 闸门 ——
 触屏失灵说明 `opened_fd` 匹配错了，事件被误吃）。
