@@ -8,8 +8,8 @@ return {
     trigger_cooldown_ms = 500,
 
     invert_layout = false,    -- [可覆盖] 反转方向
-    supports_dpad = true,
     use_analog_mode = true,   -- [可覆盖] 摇杆模式
+    supports_dpad = true,
 
     axis_threshold = 16384,
     analog_center = { [0] = 32768, [1] = 32768 },
