@@ -21,7 +21,6 @@ local AXIS_THRESHOLD_DEFAULT = 16384
 local POWER_RESET_INTERVAL = 60
 local STATE_CACHE_INTERVAL = 2
 local DEFAULT_PROFILE = "xbox_wireless_controller"
-local ABS_MT_FIRST = 47
 
 local SYSTEM_DEVICE_NAMES = {
     "pt_mt", "goodix-ts", "bd71828-pwrkey", "max77696-onkey",
@@ -69,7 +68,6 @@ local function isDevicePath(path)
 end
 
 local function nameMatches(lower_name, keywords)
-    if type(lower_name) ~= "string" then return false end
     for _, keyword in ipairs(keywords) do
         if lower_name:find(keyword, 1, true) then return true end
     end
@@ -86,6 +84,7 @@ local BluetoothController = WidgetContainer:extend {
     _config_loaded = false,
 
     opened_path = nil,
+    opened_fd = nil,   -- 开设备时记下，输入热路径上省一次表查
 
     -- 默认值的唯一归宿
     wakeup_delay = 3,
@@ -162,11 +161,7 @@ function BluetoothController:applyConfig()
         return false
     end
 
-    if self.opened_path and self.opened_path ~= profile.device_path
-        and not self:closeDevice(self.opened_path) then
-        return false
-    end
-
+    -- 旧节点由 openDevice 的"换了节点先关旧的"统一处理，这里不重复
     self.wakeup_delay = isNumberInRange(common.wakeup_delay, 1, 60)
         and common.wakeup_delay or self.wakeup_delay
     self.trigger_cooldown_ms = isNumberInRange(common.trigger_cooldown_ms, 0, 60000)
@@ -196,8 +191,9 @@ function BluetoothController:applyConfig()
 end
 
 -- 先写 .tmp 再 rename 覆盖：同一文件系统上 rename 是原子的，
--- 所以 tmp 写成功之后不需要回滚路径
-local function writeConfigAtomically(path, data, create_backup)
+-- 所以 tmp 写成功之后不需要回滚路径。
+-- 备份只在原文件 60 秒内没被改过时留（同 LuaSettings:backup），避免覆盖掉刚写的那份。
+local function writeConfigAtomically(path, data)
     local temporary_path = path .. ".tmp"
     local ok, err = util.writeToFile("return " .. data, temporary_path, true, false, true)
     if not ok then
@@ -205,7 +201,8 @@ local function writeConfigAtomically(path, data, create_backup)
         return false, err
     end
 
-    if create_backup then
+    local modification = lfs.attributes(path, "modification")
+    if type(modification) == "number" and modification < os.time() - 60 then
         os.rename(path, path .. ".old")
     end
     return os.rename(temporary_path, path)
@@ -217,14 +214,7 @@ function BluetoothController:saveFullConfig()
         return false
     end
 
-    local modification = lfs.attributes(self.settings_file, "modification")
-    local create_backup = type(modification) == "number"
-        and modification < os.time() - 60
-    local ok, err = writeConfigAtomically(
-        self.settings_file,
-        dump(self.full_config, nil, true),
-        create_backup
-    )
+    local ok, err = writeConfigAtomically(self.settings_file, dump(self.full_config, nil, true))
     if ok then
         logger.info("BT Plugin: Configuration saved")
     else
@@ -275,7 +265,9 @@ function BluetoothController:onToggleKeyRepeat()
     end)
 end
 
--- 返回 (库, {匹配掩码, 排除掩码})；掩码要等 cdefs 加载后才能取，故一并缓存
+-- 返回 (库, 掩码表)；掩码要等 cdefs 加载后才能取，故一并缓存。
+-- SCAN_ONLY 很关键：不带它 FBInk 会真的打开设备并把 fd 塞进返回值，
+-- 而我们只是做判定，那个 fd 没人接管就是泄漏。
 local function getFBInkInput()
     if _fbink_input_checked then return _fbink_input, _fbink_input_masks end
     _fbink_input_checked = true
@@ -294,45 +286,32 @@ local function getFBInkInput()
     _fbink_input = library
     -- 要求命中 JOYSTICK/DPAD 已经把电源键、加速度计、翻页键等全排除了，
     -- 只有触屏需要显式排除：它也会报 ABS_X/ABS_Y
-    _fbink_input_masks = { bit.bor(C.INPUT_JOYSTICK, C.INPUT_DPAD), C.INPUT_TOUCHSCREEN }
+    _fbink_input_masks = {
+        match = bit.bor(C.INPUT_JOYSTICK, C.INPUT_DPAD),
+        exclude = C.INPUT_TOUCHSCREEN,
+        settings = bit.bor(C.NO_RECAP, C.SCAN_ONLY),
+    }
     return _fbink_input, _fbink_input_masks
 end
 
-local function getInputDeviceName(path)
-    local event_name = path:match("^/dev/input/(event%d+)$")
-    if not event_name then return nil end
-
-    local name_file = io.open("/sys/class/input/" .. event_name .. "/device/name", "r")
-    if not name_file then return nil end
-    local name = name_file:read("*line")
-    name_file:close()
-    return name and util.trim(name)
+-- FBInk 认它是手柄，且名字不在 Kindle 内建设备名单里
+local function isControllerName(matched, name)
+    return matched == true and not nameMatches(name:lower(), SYSTEM_DEVICE_NAMES)
 end
 
-function BluetoothController:isControllerDevice(path, device_name)
-    local name = device_name or getInputDeviceName(path)
-    local lower_name = type(name) == "string" and name:lower() or nil
-    if nameMatches(lower_name, SYSTEM_DEVICE_NAMES) then
-        return false
-    end
-
+function BluetoothController:isControllerDevice(path)
     local library, masks = getFBInkInput()
     if not library then return false end
 
-    local ok, device = pcall(function()
-        return library.fbink_input_check(path, masks[1], masks[2], C.NO_RECAP)
-    end)
+    local ok, device = pcall(library.fbink_input_check,
+        path, masks.match, masks.exclude, masks.settings)
     if not ok or device == nil then return false end
 
-    local matched = device[0].matched == true
+    local is_controller = isControllerName(device.matched, ffi.string(device.name))
     C.free(device)
-    return matched
+    return is_controller
 end
 
-
-function BluetoothController:deviceExists(path)
-    return path ~= nil and path ~= "" and lfs.attributes(path, "mode") ~= nil
-end
 
 function BluetoothController:openDevice(is_reload)
     local path = self.config.device_path
@@ -348,7 +327,8 @@ function BluetoothController:openDevice(is_reload)
     end
 
     local was_open = self:isDeviceOpened(path)
-    local usable = self:deviceExists(path) and self:isControllerDevice(path)
+    -- FBInk 打得开并认出是手柄，就同时证明了节点存在，不必再单独 stat 一次
+    local usable = self:isControllerDevice(path)
 
     -- 节点不可用时关闭是硬要求：留着死 fd 会让 handleInputEvent 的闸门永远
     -- 指向一个不存在的设备，不重启无法恢复。代价是唤醒瞬间的偶发失败会丢一个
@@ -363,23 +343,21 @@ function BluetoothController:openDevice(is_reload)
         return false
     end
 
-    if was_open then
-        self.opened_path = path
-        return true
-    end
-
-    resetInputState()
-
-    local ok, err = pcall(Device.input.open, Device.input, path)
-    if ok and self:isDeviceOpened(path) then
-        self.opened_path = path
+    if not was_open then
+        resetInputState()
+        local ok, err = pcall(Device.input.open, Device.input, path)
+        if not (ok and self:isDeviceOpened(path)) then
+            self.opened_path = nil
+            self.opened_fd = nil
+            logger.warn("BT Plugin: Failed to open " .. path .. " -> " .. tostring(err or "device was not registered"))
+            return false
+        end
         logger.info("BT Plugin: Opened device " .. path)
-        return true
     end
 
-    self.opened_path = nil
-    logger.warn("BT Plugin: Failed to open " .. path .. " -> " .. tostring(err or "device was not registered"))
-    return false
+    self.opened_path = path
+    self.opened_fd = Device.input.opened_devices[path]
+    return true
 end
 
 -- 无参调用只关自己开过的节点：别去动别人的 fd
@@ -399,7 +377,10 @@ function BluetoothController:closeDevice(path)
         end
     end
 
-    if self.opened_path == path then self.opened_path = nil end
+    if self.opened_path == path then
+        self.opened_path = nil
+        self.opened_fd = nil
+    end
     return true
 end
 
@@ -408,29 +389,32 @@ function BluetoothController:reloadDevice()
 end
 
 function BluetoothController:isDeviceOpened(path)
-    local opened_devices = Device.input.opened_devices
-    return path ~= nil and opened_devices ~= nil and opened_devices[path] ~= nil
+    return Device.input.opened_devices[path] ~= nil
 end
 
+-- fbink_input_scan 一次遍历所有 /dev/input 节点并连名字一起返回，
+-- 不需要自己走 sysfs（写法同 koreader externalkeyboard.koplugin 的 findKeyboards）
 function BluetoothController:scanJoystickDevices()
     local devices = {}
+    local library, masks = getFBInkInput()
+    if not library then return devices end
 
-    for entry in dirEntries("/sys/class/input") do
-        local event_id = entry:match("^event(%d+)$")
-        if event_id then
-            local dev_path = "/dev/input/event" .. event_id
-            local clean_name = getInputDeviceName(dev_path)
-            if clean_name and clean_name ~= "" and self:isControllerDevice(dev_path, clean_name) then
-                local is_opened = self:isDeviceOpened(dev_path)
-                table.insert(devices, {
-                    path = dev_path,
-                    name = clean_name,
-                    opened = is_opened,
-                })
-                logger.info("BT Plugin: Found input device: " .. clean_name .. " at " .. dev_path .. " (opened=" .. tostring(is_opened) .. ")")
-            end
+    local count = ffi.new("size_t[1]")
+    local ok, found = pcall(library.fbink_input_scan,
+        masks.match, masks.exclude, masks.settings, count)
+    if not ok or found == nil then return devices end
+
+    for i = 0, tonumber(count[0]) - 1 do
+        local device = found[i]
+        local name = ffi.string(device.name)
+        if isControllerName(device.matched, name) then
+            local path = ffi.string(device.path)
+            local is_opened = self:isDeviceOpened(path)
+            table.insert(devices, { path = path, name = name, opened = is_opened })
+            logger.info("BT Plugin: Found input device: " .. name .. " at " .. path .. " (opened=" .. tostring(is_opened) .. ")")
         end
     end
+    C.free(found)
 
     table.sort(devices, function(left, right) return left.path < right.path end)
     return devices
@@ -534,14 +518,8 @@ function BluetoothController:pokeActivity()
 end
 
 function BluetoothController:handleInputEvent(ev)
-    if ev.type == C.EV_ABS and ev.code >= ABS_MT_FIRST then
-        return
-    end
-
-    local controller_path = self.opened_path
-    local opened_devices = Device.input.opened_devices
-    local controller_fd = controller_path and opened_devices and opened_devices[controller_path]
-    if not controller_fd or ev.fd ~= controller_fd then
+    -- 只认手柄那一个 fd；触屏事件在这里就被挡住，不需要额外的 ABS_MT 预过滤
+    if not self.opened_fd or ev.fd ~= self.opened_fd then
         return
     end
 
@@ -560,8 +538,9 @@ end
 
 function BluetoothController:parseInputDirection(ev)
     if ev.type == C.EV_KEY and (ev.value == 1 or ev.value == 2) then
-        if ev.value == 2 and G_reader_settings
-            and G_reader_settings:isTrue("input_no_key_repeat") then
+        -- KOReader 自己的重复键过滤 hook 排在我们之后（registerEventAdjustHook 是追加），
+        -- 所以这里必须自己认这个设置
+        if ev.value == 2 and G_reader_settings:isTrue("input_no_key_repeat") then
             return nil
         end
         return self.config.key_map[ev.code]
@@ -734,28 +713,17 @@ function BluetoothController:addToMainMenu(menu_items)
             local profiles = {}
 
             for profile_id, profile in pairs((self.full_config or {}).profiles or {}) do
-                if type(profile_id) == "string"
-                    and type(profile) == "table"
-                    and isDevicePath(profile.device_path) then
-                    local selected_profile_id = profile_id
-                    local selected_profile_name = type(profile.name) == "string"
-                        and profile.name or profile_id
+                if type(profile) == "table" and isDevicePath(profile.device_path) then
+                    local name = type(profile.name) == "string" and profile.name or profile_id
                     table.insert(profiles, {
-                        text = selected_profile_name,
+                        text = name,
                         checked_func = function()
-                            return self.active_profile == selected_profile_id
+                            return self.active_profile == profile_id
                         end,
                         callback = function()
-                            if not self:closeDevice() then
-                                UIManager:show(InfoMessage:new{
-                                    text = _("旧设备关闭失败"),
-                                    timeout = 2,
-                                })
-                                return
-                            end
                             self.full_config.common = self.full_config.common or {}
                             local previous_profile = self.full_config.common.active_profile
-                            self.full_config.common.active_profile = selected_profile_id
+                            self.full_config.common.active_profile = profile_id
                             if not self:applyConfig() then
                                 self.full_config.common.active_profile = previous_profile
                                 UIManager:show(InfoMessage:new{
@@ -766,8 +734,7 @@ function BluetoothController:addToMainMenu(menu_items)
                             end
                             self:saveFullConfig()
                             UIManager:show(InfoMessage:new{
-                                text = self:reloadDevice()
-                                    and _("已切换到 ") .. selected_profile_name
+                                text = self:reloadDevice() and _("已切换到 ") .. name
                                     or _("配置已切换，但未找到设备"),
                                 timeout = 2,
                             })
@@ -829,17 +796,10 @@ function BluetoothController:addToMainMenu(menu_items)
     table.insert(sub_items, {
         text = _("重新加载设备"),
         callback = function()
-            local loaded = self:loadSettings()
-            local message
-            if not loaded then
-                message = _("配置加载失败")
-            elseif self:reloadDevice() then
-                message = _("设备已加载")
-            else
-                message = _("加载失败")
-            end
             UIManager:show(InfoMessage:new{
-                text = message,
+                text = not self:loadSettings() and _("配置加载失败")
+                    or self:reloadDevice() and _("设备已加载")
+                    or _("加载失败"),
                 timeout = 2,
             })
         end

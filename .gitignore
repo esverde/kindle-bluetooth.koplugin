@@ -5,6 +5,7 @@ import/
 info/
 test/
 log/
+koreader/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
