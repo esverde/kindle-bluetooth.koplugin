@@ -266,8 +266,43 @@ with an evdev device node… We intentionally don't filter on devpath"。
 - `set_int_property` 的返回值在整个 KOReader 里**都被忽略**，没有可靠的成功信号。
   因此写状态只走 `os.execute("lipc-set-prop …")`，用退出码判断成败。
   **不要把 lipc 句柄用回写路径**（这件事发生过一次，然后被 review 抓出来）。
-- 属性：`com.lab126.btfd` 的 `BTstate`（读，0=关）与 `BTflightMode`（写，0=开）。
+- 属性：`com.lab126.btfd` 的 `BTstate`（读）与 `BTflightMode`（写，0=开）。
   较新的工具链倾向用 `ace_bt_cli radiostate`；`btfd` 在 Scribe 现固件上仍可用。
+- **`BTstate` 开启时实测返回 `2`，不是 `1`** —— 判断必须写 `state > 0`，写 `== 1` 会错。
+
+### liblipclua 来自 Amazon 固件，不是 KOReader
+
+`setupkoenv.lua:5-7` 的 `package.cpath` 是 `"common/?.so;common/?.dll;/usr/lib/lua/?.so;"`，
+而 KOReader 的 `common/` 里只有 `libopenlipclua.so`。所以 `require("liblipclua")`
+命中的是 **`/usr/lib/lua/liblipclua.so`（固件自带）** —— cpath 里有 `/usr/lib/lua/?.so`
+就是为了它。**固件升级若移走这个 so，快路径就会失效**，因此必须保留 shell 回退。
+
+### 快路径：已实测可用，决定保留
+
+Scribe / 5.18.x 实测（KOReader 未运行也可跑，只读、独立的 lipc 注册名）：
+
+```sh
+ls -l /usr/lib/lua/liblipclua.so
+# -> liblipclua.so.1.0
+
+cd /mnt/us/koreader
+./luajit -e 'package.cpath="common/?.so;/usr/lib/lua/?.so;"..package.cpath
+local ok, lipc = pcall(require, "liblipclua")
+print("liblipclua:", ok)
+local h = lipc.init("com.github.koreader.bttest")
+print("handle:", tostring(h))
+print("BTstate:", pcall(h.get_int_property, h, "com.lab126.btfd", "BTstate"))
+h:close()'
+# liblipclua:  true
+# handle:      userdata: 0x...
+# BTstate:     true  2
+```
+
+`getRealState` 因此保留 lipc 快路径 + shell 回退两条。回退分支会打一行
+`lipc BTstate unavailable, using shell` —— lipc 正常时永不出现，
+出现了就说明固件动过 so 或 `powerd.lipc_handle` 为 nil。
+
+**这一条已决定，不必再作为"两套实现"提进精简清单。**
 
 ## §7 KOReader API 用法
 

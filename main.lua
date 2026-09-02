@@ -380,6 +380,8 @@ function BluetoothController:getRealState()
         if ok and type(state) == "number" then return state > 0 end
     end
 
+    -- 走到这里说明 lipc 快路径失效了（docs §6），值得留一行
+    logger.info("BT Plugin: lipc BTstate unavailable, using shell")
     local ok, pipe = pcall(io.popen, "lipc-get-prop com.lab126.btfd BTstate")
     if not ok or not pipe then return false end
     local output = pipe:read("*all")
