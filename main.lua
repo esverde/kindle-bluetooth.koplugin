@@ -145,10 +145,8 @@ function BluetoothController:applyConfig()
         return false
     end
 
-    local active_profile = common.active_profile
-    if active_profile == nil then
-        active_profile = DEFAULT_PROFILE
-    elseif type(active_profile) ~= "string" or active_profile == "" then
+    local active_profile = common.active_profile or DEFAULT_PROFILE
+    if type(active_profile) ~= "string" or active_profile == "" then
         logger.warn("BT Plugin: Invalid active profile")
         return false
     end
@@ -172,7 +170,6 @@ function BluetoothController:applyConfig()
         self.config[k] = v
     end
     self.config.invert_layout = common.invert_layout == true
-    self.config.device_path = profile.device_path
     self.config.supports_dpad = profile.supports_dpad == true
     self.config.use_analog_mode = profile.use_analog_mode == true
     self.config.key_map = type(profile.key_map) == "table" and profile.key_map or {}
@@ -222,7 +219,6 @@ function BluetoothController:saveFullConfig()
 end
 
 function BluetoothController:setCommonSetting(key, value)
-    self.full_config = self.full_config or {}
     self.full_config.common = self.full_config.common or {}
     self.full_config.common[key] = value
     return self:saveFullConfig()
@@ -494,6 +490,12 @@ function BluetoothController:_reconnect()
     end
 end
 
+-- unschedule 必须和 scheduleIn 成对出现，否则重连任务会堆叠；只在这里成对写一次
+function BluetoothController:scheduleReconnect(delay)
+    UIManager:unschedule(self._reconnect)
+    UIManager:scheduleIn(delay, self._reconnect, self)
+end
+
 -- koreader-base 的 uevent 监听器（input/input-kindle.h:95）对任何
 -- SUBSYSTEM=input、DEVNAME=input/eventN 的 add/remove 都发事件 —— 不限 UHID，
 -- 所以手柄一连上就能立刻接管，不必等唤醒后盲试。
@@ -501,8 +503,7 @@ end
 function BluetoothController:onEvdevInputInsert(path)
     if path ~= self.config.device_path then return end
     logger.info("BT Plugin: Input device inserted: " .. path)
-    UIManager:unschedule(self._reconnect)
-    UIManager:scheduleIn(0.5, self._reconnect, self)
+    self:scheduleReconnect(0.5)
 end
 
 -- 节点消失时立刻放掉 fd，不必等下一次 openDevice 去发现它已经死了
@@ -517,8 +518,7 @@ end
 -- 只能靠这次重连把可能已经失效的 fd 换掉
 function BluetoothController:onOutOfScreenSaver()
     logger.info("BT Plugin: Device wakeup detected, scheduling reload...")
-    UIManager:unschedule(self._reconnect)
-    UIManager:scheduleIn(self.wakeup_delay, self._reconnect, self)
+    self:scheduleReconnect(self.wakeup_delay)
 end
 
 
