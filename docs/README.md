@@ -280,6 +280,28 @@ with an evdev device node… We intentionally don't filter on devpath"。
 | shell 参数转义 | `util.shell_escape(array)`，单引号包裹并用空格拼接 | `util.lua:1437` |
 | 去首尾空白 | `util.trim(s)` | `util.lua:52` |
 | 判断设备已打开 | `Device.input.opened_devices[path] ~= nil`；这张表是 Input 原型上的类成员，**永不为 nil**，不需要判空 | `input.lua:204` |
+| 遍历目录 | `for name in lfs.dir(dir) do`，**必须整体传给 for** | 见下 |
+
+### lfs.dir 的返回值不能只接一个
+
+`lfs.dir` 返回 **`(迭代器, 目录对象)`** 两个值，迭代器是无状态的，必须拿那个
+userdata 当控制变量。所以下面这种"抽个 helper"的写法是错的：
+
+```lua
+-- 错：丢掉了第二个返回值
+local ok, iterator = pcall(lfs.dir, directory)
+return iterator
+-- 用的时候报 bad argument #1 to '(for generator)' (directory metatable expected, got nil)
+```
+
+正确做法就是直接写 `for name in lfs.dir(dir) do`（KOReader 全仓库都是这个写法，
+如 `pluginloader.lua:203`、`readhistory.lua:127`），目录不存在时 `lfs.dir` 会抛错，
+所以外面套一层 `lfs.attributes(dir, "mode") == "directory"` 判断
+（同 `externalkeyboard.koplugin` 的做法）。
+
+**这个 bug 真实发生过**：`cleanupBluetoothDumps` 曾因此在点击「清理蓝牙垃圾」时
+让 KOReader 直接退出。它躲过了五轮真机测试，因为那条菜单项从来没被点过 ——
+教训是冒烟测试表必须覆盖每一个菜单项。
 
 ## §8 日志
 
@@ -379,6 +401,18 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 | 热插拔 | 关手柄，等 3 秒，再开 | `Input device removed:` → `Input device inserted:` → `Opened device` |
 | 休眠（手柄不断） | 短休眠后唤醒 | **无**任何 BT Plugin 日志；手柄直接可用 |
 | 休眠（手柄掉线） | 休眠 2 分钟以上再唤醒 | 休眠中 `Input device removed:`；唤醒后 `Input device inserted:` → `Opened device` |
+
+**每一个菜单项都要点一遍**，别只测主路径 —— 曾有一次崩溃就是因为「清理蓝牙垃圾」
+五轮测试里一次都没被点过：
+
+| 菜单项 | 期待日志 |
+| --- | --- |
+| 蓝牙开关 | 提示"Bluetooth enabled/disabled"；失败则 `Failed to change Bluetooth state` |
+| 已连接设备 | `Found input device: …` |
+| 切换配置 | `Loaded profile '…'` → `Configuration saved` |
+| 反转方向 / 摇杆模式 | `Configuration saved` |
+| 重新加载设备 | `Loaded profile` → `Opened device` |
+| 清理蓝牙垃圾 | `Cleaned up bluetooth dump files` |
 
 功能验证：摇杆推一下能翻页，**且触屏依然正常**（后者验证 fd 闸门 ——
 触屏失灵说明 `opened_fd` 匹配错了，事件被误吃）。

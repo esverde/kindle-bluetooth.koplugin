@@ -52,12 +52,6 @@ local function isNumberInRange(value, minimum, maximum)
     return type(value) == "number" and value >= minimum and value <= maximum
 end
 
-local function dirEntries(directory)
-    local ok, iterator = pcall(lfs.dir, directory)
-    if ok and type(iterator) == "function" then return iterator end
-    return function() return nil end
-end
-
 local function isDevicePath(path)
     return type(path) == "string" and path:match("^/dev/input/event%d+$") ~= nil
 end
@@ -555,11 +549,14 @@ end
 function BluetoothController:cleanupBluetoothDumps()
     local paths = {}
     for _, target in ipairs(DUMP_TARGETS) do
-        for name in dirEntries(target.directory) do
-            for _, pattern in ipairs(target.patterns) do
-                if name:match(pattern) then
-                    table.insert(paths, target.directory .. "/" .. name)
-                    break
+        -- lfs.dir 必须整体传给 for：它返回 (迭代器, 目录对象)，少了后者迭代器会报错
+        if lfs.attributes(target.directory, "mode") == "directory" then
+            for name in lfs.dir(target.directory) do
+                for _, pattern in ipairs(target.patterns) do
+                    if name:match(pattern) then
+                        table.insert(paths, target.directory .. "/" .. name)
+                        break
+                    end
                 end
             end
         end
