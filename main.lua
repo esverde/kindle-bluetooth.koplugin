@@ -59,7 +59,6 @@ local BluetoothController = WidgetContainer:extend {
     is_doc_only = false,
 
     config = {},
-    file_config = {},   -- bluetooth.lua 的内容，只读
     settings = nil,     -- 菜单可改的两个覆盖值，见 docs §10
 
     opened_path = nil,
@@ -72,7 +71,6 @@ local BluetoothController = WidgetContainer:extend {
 function BluetoothController:init()
     if not Device:isKindle() then return end
     self.config = {}
-    self.file_config = {}
     self.settings = LuaSettings:open(
         DataStorage:getSettingsDir() .. "/bluetooth_controller.lua")
     self:loadSettings()
@@ -96,13 +94,7 @@ function BluetoothController:loadSettings()
         return false
     end
 
-    local previous_config = self.file_config
-    self.file_config = file_config
-    if not self:applyConfig() then
-        self.file_config = previous_config
-        return false
-    end
-    return true
+    return self:applyConfig(file_config)
 end
 
 -- 取值顺序：菜单写的覆盖值 > bluetooth.lua。不存在第三层兜底。
@@ -112,10 +104,9 @@ function BluetoothController:override(key, from_file)
     return value
 end
 
--- 全部字段必填且必须合法，任何一项不过关就整份拒绝（docs §10）。
+-- 全部字段必填且必须合法，任何一项不过关就整份拒绝、运行态不动（docs §10）。
 -- 这是唯一的校验点，通过之后输入热路径可以直接索引，不再逐字段重查。
-function BluetoothController:applyConfig()
-    local cfg = self.file_config
+function BluetoothController:applyConfig(cfg)
     local checks = {
         { "device_path",         isDevicePath(cfg.device_path) },
         { "trigger_cooldown_ms", isNumberInRange(cfg.trigger_cooldown_ms, 0, 60000) },
@@ -140,19 +131,15 @@ function BluetoothController:applyConfig()
         end
     end
 
-    self.trigger_cooldown_ms = cfg.trigger_cooldown_ms
-    self.config = {
-        device_path      = cfg.device_path,
-        key_map          = cfg.key_map,
-        dpad_map         = cfg.dpad_map,
-        analog_map       = cfg.analog_map,
-        analog_center    = cfg.analog_center,
-        analog_threshold = cfg.axis_threshold,
-        supports_dpad    = cfg.supports_dpad == true,
-        invert_layout    = self:override("invert_layout", cfg.invert_layout) == true,
-        -- 不能用 or：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
-        use_analog_mode  = self:override("use_analog_mode", cfg.use_analog_mode) == true,
-    }
+    -- 整表拷贝，避免逐字段枚举（每加一个配置项都要同步一次），再覆盖三项
+    self.config = {}
+    for k, v in pairs(cfg) do
+        self.config[k] = v
+    end
+    self.config.supports_dpad = cfg.supports_dpad == true
+    self.config.invert_layout = self:override("invert_layout", cfg.invert_layout) == true
+    -- 不能用 or：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
+    self.config.use_analog_mode = self:override("use_analog_mode", cfg.use_analog_mode) == true
     resetInputState()
     logger.info("BT Plugin: Loaded config for " .. cfg.device_path)
     return true
@@ -466,7 +453,7 @@ function BluetoothController:parseAnalogInput(ev)
     if not mapping then return nil end
 
     local center = self.config.analog_center[ev.code] or AXIS_CENTER_DEFAULT
-    local threshold = self.config.analog_threshold
+    local threshold = self.config.axis_threshold
     local deviation = math.abs(ev.value - center)
 
     _shared_axis_values[ev.code] = deviation
@@ -490,7 +477,7 @@ function BluetoothController:parseAnalogInput(ev)
     if _shared_triggered then return nil end
 
     if _shared_last_trigger_time
-        and time.since(_shared_last_trigger_time) < time.ms(self.trigger_cooldown_ms) then
+        and time.since(_shared_last_trigger_time) < time.ms(self.config.trigger_cooldown_ms) then
         return nil
     end
 
