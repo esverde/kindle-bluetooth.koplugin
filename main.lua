@@ -19,8 +19,6 @@ local C = ffi.C
 local AXIS_CENTER_DEFAULT = 32768
 local AXIS_THRESHOLD_DEFAULT = 16384
 local POWER_RESET_INTERVAL = 60
-local DEFAULT_WAKEUP_DELAY = 3
-local DEFAULT_TRIGGER_COOLDOWN_MS = 500
 local STATE_CACHE_INTERVAL = 2
 local DEFAULT_PROFILE = "xbox_wireless_controller"
 local ABS_MT_FIRST = 47
@@ -31,13 +29,13 @@ local SYSTEM_DEVICE_NAMES = {
 }
 
 local DUMP_TARGETS = {
-    { directory = "/mnt/us", pattern = "^audiomgrd_.*%.core$" },
-    { directory = "/mnt/us", pattern = "^btmanagerd_.*%.core$" },
-    { directory = "/mnt/us", pattern = "^Indexer_Dump_.*%.txt$" },
-    { directory = "/mnt/us/documents", pattern = "^audiomgrd_.*_crash_.*$" },
-    { directory = "/mnt/us/documents", pattern = "^btmanagerd_.*_crash_.*$" },
-    { directory = "/mnt/us/documents", pattern = "^.*btmanagerd.*%.sdr$" },
-    { directory = "/mnt/us/documents", pattern = "^.*audiomgrd.*%.sdr$" },
+    { directory = "/mnt/us", patterns = {
+        "^audiomgrd_.*%.core$", "^btmanagerd_.*%.core$", "^Indexer_Dump_.*%.txt$",
+    } },
+    { directory = "/mnt/us/documents", patterns = {
+        "^audiomgrd_.*_crash_", "^btmanagerd_.*_crash_",
+        "audiomgrd.*%.sdr$", "btmanagerd.*%.sdr$",
+    } },
 }
 
 local _shared_last_trigger_time = nil
@@ -47,6 +45,7 @@ local _shared_triggered = false
 local _shared_axis_values = {}
 local _current_active_controller = nil
 local _fbink_input
+local _fbink_input_masks
 local _fbink_input_checked = false
 
 local function resetInputState()
@@ -54,17 +53,15 @@ local function resetInputState()
     _shared_triggered = false
 end
 
-local function isFiniteNumber(value)
-    return type(value) == "number"
-        and value == value
-        and value ~= math.huge
-        and value ~= -math.huge
+-- NaN 与 ±inf 都过不了这两个比较，不需要单独判
+local function isNumberInRange(value, minimum, maximum)
+    return type(value) == "number" and value >= minimum and value <= maximum
 end
 
-local function isNumberInRange(value, minimum, maximum)
-    return isFiniteNumber(value)
-        and value >= minimum
-        and value <= maximum
+local function dirEntries(directory)
+    local ok, iterator = pcall(lfs.dir, directory)
+    if ok and type(iterator) == "function" then return iterator end
+    return function() return nil end
 end
 
 local function isDevicePath(path)
@@ -89,15 +86,15 @@ local BluetoothController = WidgetContainer:extend {
     _config_loaded = false,
 
     opened_path = nil,
-    opened_by_plugin = false,
-    wakeup_delay = DEFAULT_WAKEUP_DELAY,
-    trigger_cooldown_ms = DEFAULT_TRIGGER_COOLDOWN_MS,
+
+    -- 默认值的唯一归宿
+    wakeup_delay = 3,
+    trigger_cooldown_ms = 500,
 
     _state_cached = false,
     _state_time = nil,
 
     _wakeup_task = nil,
-    _hook_restore_task = nil,
 }
 
 function BluetoothController:init()
@@ -171,17 +168,13 @@ function BluetoothController:applyConfig()
     end
 
     self.wakeup_delay = isNumberInRange(common.wakeup_delay, 1, 60)
-        and common.wakeup_delay or DEFAULT_WAKEUP_DELAY
+        and common.wakeup_delay or self.wakeup_delay
     self.trigger_cooldown_ms = isNumberInRange(common.trigger_cooldown_ms, 0, 60000)
-        and common.trigger_cooldown_ms or DEFAULT_TRIGGER_COOLDOWN_MS
+        and common.trigger_cooldown_ms or self.trigger_cooldown_ms
     self.active_profile = active_profile
-    self.config = {
-        invert_layout = common.invert_layout == true,
-        device_path = profile.device_path,
-        supports_dpad = profile.supports_dpad == true,
-        use_analog_mode = profile.use_analog_mode == true,
-    }
 
+    -- 这里是配置的唯一校验点，输入热路径上不再逐字段重查
+    self.config = {}
     for k, v in pairs(profile) do
         self.config[k] = v
     end
@@ -193,18 +186,17 @@ function BluetoothController:applyConfig()
     self.config.dpad_map = type(profile.dpad_map) == "table" and profile.dpad_map or {}
     self.config.analog_map = type(profile.analog_map) == "table" and profile.analog_map or {}
     self.config.analog_center = type(profile.analog_center) == "table" and profile.analog_center or {}
-    local analog_threshold = profile.axis_threshold
-    if analog_threshold == nil then
-        analog_threshold = profile.analog_threshold
-    end
-    self.config.analog_threshold = isNumberInRange(analog_threshold, 0, 65535)
-        and analog_threshold or AXIS_THRESHOLD_DEFAULT
+    local threshold = profile.axis_threshold or profile.analog_threshold
+    self.config.analog_threshold = isNumberInRange(threshold, 0, 65535)
+        and threshold or AXIS_THRESHOLD_DEFAULT
     resetInputState()
     local profile_name = type(profile.name) == "string" and profile.name or active_profile
     logger.info("BT Plugin: Loaded profile '" .. profile_name .. "'")
     return true
 end
 
+-- 先写 .tmp 再 rename 覆盖：同一文件系统上 rename 是原子的，
+-- 所以 tmp 写成功之后不需要回滚路径
 local function writeConfigAtomically(path, data, create_backup)
     local temporary_path = path .. ".tmp"
     local ok, err = util.writeToFile("return " .. data, temporary_path, true, false, true)
@@ -213,26 +205,10 @@ local function writeConfigAtomically(path, data, create_backup)
         return false, err
     end
 
-    local backup_path = path .. ".old"
     if create_backup then
-        local moved, move_err = os.rename(path, backup_path)
-        if not moved then
-            os.remove(temporary_path)
-            return false, move_err
-        end
+        os.rename(path, path .. ".old")
     end
-
-    local replaced, replace_err = os.rename(temporary_path, path)
-    if replaced then return true end
-
-    os.remove(temporary_path)
-    if create_backup then
-        local restored, restore_err = os.rename(backup_path, path)
-        if not restored then
-            return false, tostring(replace_err) .. " (restore failed: " .. tostring(restore_err) .. ")"
-        end
-    end
-    return false, replace_err
+    return os.rename(temporary_path, path)
 end
 
 function BluetoothController:saveFullConfig()
@@ -287,26 +263,21 @@ function BluetoothController:registerInputHook()
     _shared_hook_registered = true
 end
 
+-- 切换 input_no_key_repeat 会重建整条 eventAdjustHook 链，下一个 tick 里把自己挂回去。
+-- 任务跑得晚也无害：它自己会检查还是不是当前实例。
 function BluetoothController:onToggleKeyRepeat()
-    if self._hook_restore_task then
-        UIManager:unschedule(self._hook_restore_task)
-    end
-
-    local task
-    task = function()
-        if self._hook_restore_task == task then self._hook_restore_task = nil end
-        if _current_active_controller ~= self then return end
-        if Device.input.eventAdjustHook == Input.eventAdjustHook then
+    UIManager:nextTick(function()
+        if _current_active_controller == self
+            and Device.input.eventAdjustHook == Input.eventAdjustHook then
             _shared_hook_registered = false
             self:registerInputHook()
         end
-    end
-    self._hook_restore_task = task
-    UIManager:scheduleIn(0, task)
+    end)
 end
 
+-- 返回 (库, {匹配掩码, 排除掩码})；掩码要等 cdefs 加载后才能取，故一并缓存
 local function getFBInkInput()
-    if _fbink_input_checked then return _fbink_input end
+    if _fbink_input_checked then return _fbink_input, _fbink_input_masks end
     _fbink_input_checked = true
 
     local cdefs_loaded = pcall(require, "ffi/fbink_input_h")
@@ -321,7 +292,10 @@ local function getFBInkInput()
         return nil
     end
     _fbink_input = library
-    return _fbink_input
+    -- 要求命中 JOYSTICK/DPAD 已经把电源键、加速度计、翻页键等全排除了，
+    -- 只有触屏需要显式排除：它也会报 ABS_X/ABS_Y
+    _fbink_input_masks = { bit.bor(C.INPUT_JOYSTICK, C.INPUT_DPAD), C.INPUT_TOUCHSCREEN }
+    return _fbink_input, _fbink_input_masks
 end
 
 local function getInputDeviceName(path)
@@ -342,34 +316,11 @@ function BluetoothController:isControllerDevice(path, device_name)
         return false
     end
 
-    local library = getFBInkInput()
+    local library, masks = getFBInkInput()
     if not library then return false end
 
     local ok, device = pcall(function()
-        return library.fbink_input_check(
-            path,
-            bit.bor(C.INPUT_JOYSTICK, C.INPUT_DPAD),
-            bit.bor(
-                C.INPUT_POINTINGSTICK,
-                C.INPUT_MOUSE,
-                C.INPUT_TOUCHPAD,
-                C.INPUT_TOUCHSCREEN,
-                C.INPUT_TABLET,
-                C.INPUT_SCALED_TABLET,
-                C.INPUT_ACCELEROMETER,
-                C.INPUT_KEYBOARD,
-                C.INPUT_POWER_BUTTON,
-                C.INPUT_SLEEP_COVER,
-                C.INPUT_PAGINATION_BUTTONS,
-                C.INPUT_HOME_BUTTON,
-                C.INPUT_LIGHT_BUTTON,
-                C.INPUT_MENU_BUTTON,
-                C.INPUT_ROTATION_EVENT,
-                C.INPUT_VOLUME_BUTTONS,
-                C.INPUT_KINDLE_FRAME_TAP
-            ),
-            C.NO_RECAP
-        )
+        return library.fbink_input_check(path, masks[1], masks[2], C.NO_RECAP)
     end)
     if not ok or device == nil then return false end
 
@@ -390,92 +341,65 @@ function BluetoothController:openDevice(is_reload)
         return false
     end
 
+    -- 换了节点先关旧的
     if self.opened_path and self.opened_path ~= path
         and not self:closeDevice(self.opened_path) then
         return false
     end
 
-    if self.opened_path == path and not self:isDeviceOpened(path) then
-        self.opened_path = nil
-        self.opened_by_plugin = false
-    end
+    local was_open = self:isDeviceOpened(path)
+    local usable = self:deviceExists(path) and self:isControllerDevice(path)
 
-    if self:isDeviceOpened(path) then
-        if not self:deviceExists(path) or not self:isControllerDevice(path) then
-            if self.opened_path == path then
-                if self.opened_by_plugin then self:closeDevice(path) end
-                self.opened_path = nil
-                self.opened_by_plugin = false
-            end
-            return false
-        end
-        self.opened_path = path
-        if not self.opened_by_plugin or not is_reload then return true end
+    -- 节点不可用时关闭是硬要求：留着死 fd 会让 handleInputEvent 的闸门永远
+    -- 指向一个不存在的设备，不重启无法恢复。代价是唤醒瞬间的偶发失败会丢一个
+    -- 还在工作的 fd，但那一侧可由下次唤醒或「重新加载设备」恢复。
+    if was_open and (is_reload or not usable) then
         if not self:closeDevice(path) then return false end
+        was_open = false
     end
 
-    if not self:deviceExists(path) then
-        logger.info("BT Plugin: Device " .. path .. " not found")
+    if not usable then
+        logger.info("BT Plugin: Device " .. path .. " unavailable or not a supported controller")
         return false
     end
 
-    if not self:isControllerDevice(path) then
-        logger.warn("BT Plugin: Device " .. path .. " is not a supported controller")
-        return false
+    if was_open then
+        self.opened_path = path
+        return true
     end
 
     resetInputState()
 
-    local success, err = pcall(Device.input.open, Device.input, path)
-    if success and self:isDeviceOpened(path) then
+    local ok, err = pcall(Device.input.open, Device.input, path)
+    if ok and self:isDeviceOpened(path) then
         self.opened_path = path
-        self.opened_by_plugin = true
         logger.info("BT Plugin: Opened device " .. path)
-    else
-        if self:isDeviceOpened(path) then
-            self.opened_path = path
-            self.opened_by_plugin = true
-            self:closeDevice(path)
-        end
-        self.opened_path = nil
-        self.opened_by_plugin = false
-        logger.warn("BT Plugin: Failed to open " .. path .. " -> " .. tostring(err or "device was not registered"))
-    end
-    return success and self.opened_path == path and self:isDeviceOpened(path)
-end
-
-function BluetoothController:closeDevice(path)
-    path = path or self.opened_path or self.config.device_path
-    if not path then return true end
-    if path ~= self.opened_path then return true end
-
-    if not self.opened_by_plugin then
-        self.opened_path = nil
-        self.opened_by_plugin = false
         return true
     end
+
+    self.opened_path = nil
+    logger.warn("BT Plugin: Failed to open " .. path .. " -> " .. tostring(err or "device was not registered"))
+    return false
+end
+
+-- 无参调用只关自己开过的节点：别去动别人的 fd
+function BluetoothController:closeDevice(path)
+    path = path or self.opened_path
+    if not path then return true end
 
     if self:isDeviceOpened(path) then
         logger.info("BT Plugin: Closing device " .. path)
         local ok, err = pcall(Device.input.close, Device.input, path)
-        if not ok then
-            if not self:isDeviceOpened(path) then
-                self.opened_path = nil
-                self.opened_by_plugin = false
-            end
-            logger.warn("BT Plugin: Failed to close " .. path .. " -> " .. tostring(err))
+        if self:isDeviceOpened(path) then
+            logger.warn("BT Plugin: Failed to close " .. path .. " -> " .. tostring(err or "still open"))
             return false
+        end
+        if not ok then
+            logger.warn("BT Plugin: Close raised on " .. path .. " -> " .. tostring(err))
         end
     end
 
-    if self:isDeviceOpened(path) then
-        logger.warn("BT Plugin: Device " .. path .. " remained open")
-        return false
-    end
-    if self.opened_path == path then
-        self.opened_path = nil
-        self.opened_by_plugin = false
-    end
+    if self.opened_path == path then self.opened_path = nil end
     return true
 end
 
@@ -491,10 +415,7 @@ end
 function BluetoothController:scanJoystickDevices()
     local devices = {}
 
-    local ok, iterator = pcall(lfs.dir, "/sys/class/input")
-    if not ok or type(iterator) ~= "function" then return devices end
-
-    for entry in iterator do
+    for entry in dirEntries("/sys/class/input") do
         local event_id = entry:match("^event(%d+)$")
         if event_id then
             local dev_path = "/dev/input/event" .. event_id
@@ -516,24 +437,18 @@ function BluetoothController:scanJoystickDevices()
 end
 
 
+-- KindlePowerD 已经持有一个长驻 lipc 句柄；自己 init+close 一个反而比它想省掉的 fork 更贵
+local function btLipc()
+    local powerd = Device:getPowerDevice()
+    return powerd and powerd.lipc_handle
+end
+
 function BluetoothController:getRealState()
-    local native_ok, native_state = pcall(function()
-        local has_lipc, lipc = pcall(require, "liblipclua")
-        if not has_lipc then return nil end
-        local handle = lipc.init("com.github.koreader.bluetooth_controller")
-        if not handle then return nil end
-        local ok, state = pcall(
-            handle.get_int_property,
-            handle,
-            "com.lab126.btfd",
-            "BTstate"
-        )
-        handle:close()
-        if not ok then return nil end
-        return state
-    end)
-    if native_ok and type(native_state) == "number" then
-        return native_state > 0
+    local lipc = btLipc()
+    if lipc then
+        -- 取不到属性时返回 nil 而不抛错，所以必须判 state
+        local ok, state = pcall(lipc.get_int_property, lipc, "com.lab126.btfd", "BTstate")
+        if ok and type(state) == "number" then return state > 0 end
     end
 
     local ok, output = pcall(function()
@@ -555,32 +470,12 @@ function BluetoothController:getDisplayState()
     return self._state_cached
 end
 
+-- 写状态只走 shell：set_int_property 没有可靠的成功返回值，
+-- os.execute 的退出码是唯一能据以判断成败的信号
 function BluetoothController:setBluetoothState(enable)
     local val = enable and 0 or 1
     local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
-    local native_ok, native_result = pcall(function()
-        local has_lipc, lipc = pcall(require, "liblipclua")
-        if not has_lipc then return false end
-        local handle = lipc.init("com.github.koreader.bluetooth_controller")
-        if not handle then return false end
-        local ok = pcall(
-            handle.set_int_property,
-            handle,
-            "com.lab126.btfd",
-            "BTflightMode",
-            val
-        )
-        handle:close()
-        return ok
-    end)
-
-    local success = native_ok and native_result
-    if not success then
-        local exit_code = os.execute(cmd)
-        success = exit_code == 0
-    end
-
-    if not success then
+    if os.execute(cmd) ~= 0 then
         logger.warn("BT Plugin: Failed to change Bluetooth state")
         UIManager:show(InfoMessage:new { text = _("蓝牙切换失败"), timeout = 2 })
         return false
@@ -669,9 +564,7 @@ function BluetoothController:parseInputDirection(ev)
             and G_reader_settings:isTrue("input_no_key_repeat") then
             return nil
         end
-        local key_map = self.config.key_map
-        local direction = type(key_map) == "table" and key_map[ev.code]
-        return isFiniteNumber(direction) and direction or nil
+        return self.config.key_map[ev.code]
     end
 
     if ev.type == C.EV_ABS then
@@ -687,31 +580,17 @@ end
 
 function BluetoothController:parseDpadInput(ev)
     if ev.value == 0 then return nil end
-    local dpad_map = self.config.dpad_map
-    local axis_map = type(dpad_map) == "table" and dpad_map[ev.code]
-    local direction = type(axis_map) == "table" and axis_map[ev.value]
-    return isFiniteNumber(direction) and direction or nil
+    local axis_map = self.config.dpad_map[ev.code]
+    return axis_map and axis_map[ev.value]
 end
 
 function BluetoothController:parseAnalogInput(ev)
     local analog_map = self.config.analog_map
-    if type(analog_map) ~= "table" or type(ev.value) ~= "number" then return nil end
     local mapping = analog_map[ev.code]
-    if type(mapping) ~= "table"
-        or not isFiniteNumber(mapping.low_dir)
-        or not isFiniteNumber(mapping.high_dir) then
-        return nil
-    end
+    if not mapping then return nil end
 
-    local centers = self.config.analog_center
-    local center = type(centers) == "table" and centers[ev.code]
-    if not isNumberInRange(center, 0, 65535) then
-        center = AXIS_CENTER_DEFAULT
-    end
+    local center = self.config.analog_center[ev.code] or AXIS_CENTER_DEFAULT
     local threshold = self.config.analog_threshold
-    if not isNumberInRange(threshold, 0, 65535) then
-        threshold = AXIS_THRESHOLD_DEFAULT
-    end
     local deviation = math.abs(ev.value - center)
 
     _shared_axis_values[ev.code] = deviation
@@ -753,20 +632,21 @@ end
 function BluetoothController:cleanupBluetoothDumps()
     local paths = {}
     for _, target in ipairs(DUMP_TARGETS) do
-        local ok, iterator = pcall(lfs.dir, target.directory)
-        if ok and type(iterator) == "function" then
-            for name in iterator do
-                if name:match(target.pattern) then
+        for name in dirEntries(target.directory) do
+            for _, pattern in ipairs(target.patterns) do
+                if name:match(pattern) then
                     table.insert(paths, target.directory .. "/" .. name)
+                    break
                 end
             end
         end
     end
 
-    for _, path in ipairs(paths) do
-        local command = "rm -rf -- " .. util.shell_escape({ path }) .. " 2>/dev/null"
+    -- 一次 rm 处理全部，别每个文件 fork 一次
+    if #paths > 0 then
+        local command = "rm -rf -- " .. util.shell_escape(paths) .. " 2>/dev/null"
         if os.execute(command) ~= 0 then
-            logger.warn("BT Plugin: Failed to remove bluetooth dump")
+            logger.warn("BT Plugin: Failed to remove bluetooth dumps")
             return false
         end
     end
@@ -830,15 +710,14 @@ function BluetoothController:addToMainMenu(menu_items)
                 local is_current = (dev.path == self.config.device_path)
                 local status_tag, status_desc = unpack(DEVICE_STATUS[is_current][dev.opened])
                 status_tag, status_desc = _(status_tag), _(status_desc)
-                local device_name, device_path, device_status_desc = dev.name, dev.path, status_desc
 
                 table.insert(items, {
-                    text = device_name .. status_tag,
+                    text = dev.name .. status_tag,
                     callback = function()
                         UIManager:show(InfoMessage:new{
                             text = string.format(
                                 _("设备名称: %s\n设备节点: %s\n连接状态: %s"),
-                                device_name, device_path, device_status_desc),
+                                dev.name, dev.path, status_desc),
                             timeout = 4,
                         })
                     end,
@@ -988,10 +867,6 @@ function BluetoothController:onExit()
     if self._wakeup_task then
         UIManager:unschedule(self._wakeup_task)
         self._wakeup_task = nil
-    end
-    if self._hook_restore_task then
-        UIManager:unschedule(self._hook_restore_task)
-        self._hook_restore_task = nil
     end
     if _current_active_controller == self then
         self:closeDevice()
