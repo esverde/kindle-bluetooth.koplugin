@@ -529,7 +529,7 @@ function BluetoothController:addToMainMenu(menu_items)
         return {
             text = text,
             checked_func = function()
-                return (self.config.use_analog_mode == true) == analog
+                return self.config.use_analog_mode == analog
             end,
             callback = function()
                 self.config.use_analog_mode = analog
@@ -584,7 +584,7 @@ function BluetoothController:addToMainMenu(menu_items)
     table.insert(sub_items, {
         text = _("摇杆模式"),
         enabled_func = function()
-            return self.config.supports_dpad == true
+            return self.config.supports_dpad
         end,
         sub_item_table = {
             joystickModeItem(_("模拟摇杆"), true),
