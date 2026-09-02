@@ -1,11 +1,12 @@
+local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
+local LuaSettings = require("luasettings")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
 local Event = require("ui/event")
-local dump = require("dump")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local time = require("ui/time")
@@ -61,9 +62,8 @@ local BluetoothController = WidgetContainer:extend {
     is_doc_only = false,
 
     config = {},
-    full_config = {},
-    settings_file = nil,
-    _config_loaded = false,
+    file_config = {},   -- bluetooth.lua 的内容，只读
+    settings = nil,     -- 菜单可改的三个覆盖值，见 docs §10
 
     opened_path = nil,
     opened_fd = nil,
@@ -77,8 +77,9 @@ local BluetoothController = WidgetContainer:extend {
 function BluetoothController:init()
     if not Device:isKindle() then return end
     self.config = {}
-    self.full_config = {}
-    self.settings_file = self.path .. "/bluetooth.lua"
+    self.file_config = {}
+    self.settings = LuaSettings:open(
+        DataStorage:getSettingsDir() .. "/bluetooth_controller.lua")
     self:loadSettings()
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
@@ -86,45 +87,51 @@ function BluetoothController:init()
     self:openDevice(false)
 end
 
+-- bluetooth.lua 只读：插件从不改写它（docs §10）
 function BluetoothController:loadSettings()
-    self._config_loaded = false
-    local loader = loadfile(self.settings_file)
+    local loader = loadfile(self.path .. "/bluetooth.lua")
     if not loader then
         logger.warn("BT Plugin: Config file missing or unparsable, using defaults")
         return false
     end
 
-    local ok, full_config = pcall(loader)
-    if not ok or type(full_config) ~= "table" then
+    local ok, file_config = pcall(loader)
+    if not ok or type(file_config) ~= "table" then
         logger.warn("BT Plugin: Failed to evaluate config file")
         return false
     end
 
-    local previous_config = self.full_config
-    self.full_config = full_config
+    local previous_config = self.file_config
+    self.file_config = file_config
     if not self:applyConfig() then
-        self.full_config = previous_config
+        self.file_config = previous_config
         return false
     end
-    self._config_loaded = true
     return true
 end
 
+-- 取值顺序：菜单写的覆盖值 > bluetooth.lua > 内置默认
+function BluetoothController:override(key, fallback)
+    local value = self.settings:readSetting(key)
+    if value == nil then return fallback end
+    return value
+end
+
 function BluetoothController:applyConfig()
-    local common = self.full_config.common
+    local common = self.file_config.common
     if common ~= nil and type(common) ~= "table" then
         logger.warn("BT Plugin: Invalid common configuration")
         return false
     end
     common = common or {}
 
-    local profiles = self.full_config.profiles
+    local profiles = self.file_config.profiles
     if type(profiles) ~= "table" then
         logger.warn("BT Plugin: Missing profiles configuration")
         return false
     end
 
-    local active_profile = common.active_profile or DEFAULT_PROFILE
+    local active_profile = self:override("active_profile", common.active_profile) or DEFAULT_PROFILE
     if type(active_profile) ~= "string" or active_profile == "" then
         logger.warn("BT Plugin: Invalid active profile")
         return false
@@ -145,9 +152,12 @@ function BluetoothController:applyConfig()
     for k, v in pairs(profile) do
         self.config[k] = v
     end
-    self.config.invert_layout = common.invert_layout == true
+    self.config.invert_layout = self:override("invert_layout", common.invert_layout) == true
     self.config.supports_dpad = profile.supports_dpad == true
-    self.config.use_analog_mode = profile.use_analog_mode == true
+    -- 不能用 or：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
+    local analog_mode = self:override("analog_mode", {})[active_profile]
+    if analog_mode == nil then analog_mode = profile.use_analog_mode end
+    self.config.use_analog_mode = analog_mode == true
     self.config.key_map = type(profile.key_map) == "table" and profile.key_map or {}
     self.config.dpad_map = type(profile.dpad_map) == "table" and profile.dpad_map or {}
     self.config.analog_map = type(profile.analog_map) == "table" and profile.analog_map or {}
@@ -161,52 +171,17 @@ function BluetoothController:applyConfig()
     return true
 end
 
--- docs §7
-local function writeConfigAtomically(path, data)
-    local temporary_path = path .. ".tmp"
-    local ok, err = util.writeToFile("return " .. data, temporary_path, true, false, true)
-    if not ok then
-        os.remove(temporary_path)
-        return false, err
-    end
-
-    local modification = lfs.attributes(path, "modification")
-    if type(modification) == "number" and modification < os.time() - 60 then
-        os.rename(path, path .. ".old")
-    end
-    return os.rename(temporary_path, path)
+-- LuaSettings:flush 自带原子写 + .old 备份 + fsync（luasettings.lua:270）
+function BluetoothController:saveOverride(key, value)
+    self.settings:saveSetting(key, value)
+    self.settings:flush()
+    logger.info("BT Plugin: Saved override " .. key)
 end
 
-function BluetoothController:saveFullConfig()
-    if not self._config_loaded then
-        logger.warn("BT Plugin: Refusing to overwrite config file that was never loaded successfully")
-        return false
-    end
-
-    local ok, err = writeConfigAtomically(self.settings_file, dump(self.full_config, nil, true))
-    if ok then
-        logger.info("BT Plugin: Configuration saved")
-    else
-        logger.warn("BT Plugin: Failed to write config file -> " .. tostring(err))
-    end
-    return ok
-end
-
-function BluetoothController:setCommonSetting(key, value)
-    self.full_config.common = self.full_config.common or {}
-    self.full_config.common[key] = value
-    return self:saveFullConfig()
-end
-
-function BluetoothController:setActiveProfileSetting(key, value)
-    local profiles = self.full_config and self.full_config.profiles
-    local profile = profiles and self.active_profile and profiles[self.active_profile]
-    if type(profile) ~= "table" then
-        logger.warn("BT Plugin: Cannot update missing active profile")
-        return false
-    end
-    profile[key] = value
-    return self:saveFullConfig()
+function BluetoothController:saveAnalogMode(analog)
+    local modes = self:override("analog_mode", {})
+    modes[self.active_profile] = analog
+    self:saveOverride("analog_mode", modes)
 end
 
 function BluetoothController:registerInputHook()
@@ -591,7 +566,7 @@ function BluetoothController:addToMainMenu(menu_items)
             callback = function()
                 self.config.use_analog_mode = analog
                 resetInputState()
-                self:setActiveProfileSetting("use_analog_mode", analog)
+                self:saveAnalogMode(analog)
             end,
         }
     end
@@ -635,7 +610,7 @@ function BluetoothController:addToMainMenu(menu_items)
         sub_item_table_func = function()
             local profiles = {}
 
-            for profile_id, profile in pairs((self.full_config or {}).profiles or {}) do
+            for profile_id, profile in pairs(self.file_config.profiles or {}) do
                 if type(profile) == "table" and isDevicePath(profile.device_path) then
                     local name = type(profile.name) == "string" and profile.name or profile_id
                     table.insert(profiles, {
@@ -644,18 +619,17 @@ function BluetoothController:addToMainMenu(menu_items)
                             return self.active_profile == profile_id
                         end,
                         callback = function()
-                            self.full_config.common = self.full_config.common or {}
-                            local previous_profile = self.full_config.common.active_profile
-                            self.full_config.common.active_profile = profile_id
+                            -- applyConfig 在校验通过前不改运行态，失败时只需还原覆盖值
+                            local previous = self.settings:readSetting("active_profile")
+                            self:saveOverride("active_profile", profile_id)
                             if not self:applyConfig() then
-                                self.full_config.common.active_profile = previous_profile
+                                self:saveOverride("active_profile", previous)
                                 UIManager:show(InfoMessage:new{
                                     text = _("配置切换失败"),
                                     timeout = 2,
                                 })
                                 return
                             end
-                            self:saveFullConfig()
                             UIManager:show(InfoMessage:new{
                                 text = self:reloadDevice() and _("已切换到 ") .. name
                                     or _("配置已切换，但未找到设备"),
@@ -675,7 +649,7 @@ function BluetoothController:addToMainMenu(menu_items)
         checked_func = function() return self.config.invert_layout end,
         callback = function()
             self.config.invert_layout = not self.config.invert_layout
-            self:setCommonSetting("invert_layout", self.config.invert_layout)
+            self:saveOverride("invert_layout", self.config.invert_layout)
         end
     })
 

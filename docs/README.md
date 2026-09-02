@@ -47,8 +47,9 @@ grep "Found input device" /mnt/us/koreader/crash.log
 # BT Plugin: Found input device: Xbox Wireless Controller at /dev/input/event6 (opened=true)
 ```
 
-⚠️ **回写会抹掉注释**。任何一次改设置（反转方向、摇杆模式、切换配置）
-都会用 `dump` 重写整个文件，手写的注释不会保留。想留注释请另存一份。
+**`bluetooth.lua` 是只读的**，插件永不改写它，注释和格式随你怎么写。
+菜单能改的三项（反转方向、摇杆模式、切换配置）写到另一个文件，见 §10 ——
+其中也包括「改了 `bluetooth.lua` 里那三项却不生效」这个后果。
 
 ## 输入设备边界
 
@@ -83,9 +84,8 @@ KOReader。这是 in-app 版的 evdev 独占（grab）：不消费的话，"上�
 - 模拟摇杆同时使用"回到死区"和时间冷却两层去抖。
 - 蓝牙状态查询带 2 秒缓存，避免菜单每次重绘都 fork 一个进程。
 - 手柄掉线与重连**完全由 uevent 事件驱动**，没有任何定时轮询或唤醒重连（见 §3）。
-- 只有成功读取过配置文件才允许回写（`_config_loaded` 闸门）。否则配置文件缺失或损坏时，
-  第一次菜单操作就会把整份 profiles 覆盖成 `{common={...}}`。
-- 配置先写 `.tmp` 并 fsync，再 `rename` 原子替换；原文件 60 秒内未被改过时留 `.old` 备份。
+- 配置分两个文件：手写的只读，机器写的另存（见 §10）。落盘交给 `LuaSettings`，
+  原子写、`.old` 备份、fsync 都由它负责，插件不再手写这套逻辑。
 
 ---
 
@@ -399,6 +399,47 @@ if ok or err == C.ENODEV then
 | `btLipc` | 复用 KindlePowerD 的长驻句柄；自己 `lipc.init()` + `close()` 一个比它想省掉的 fork 更贵 |
 | `trigger_cooldown_ms` 在类表上 | 默认值的唯一归宿，`applyConfig` 只在配置里有合法值时覆盖 |
 | `DEVICE_TAGS` 存原文 | `_()` 在使用处调用；模块只加载一次，在表里翻译会把语言冻结在加载时刻 |
+
+## §10 配置分两个文件
+
+一个手写文件被机器改写，必然导致格式、键序、注释被序列化器重写。所以拆开：
+
+| 文件 | 谁写 | 内容 |
+| --- | --- | --- |
+| `<插件目录>/bluetooth.lua` | **只有用户**，插件永不改写 | `device_path`、三张映射表、`axis_threshold`、`trigger_cooldown_ms`，以及三个可覆盖项的初始默认值 |
+| `<settings>/bluetooth_controller.lua` | 只有插件（`LuaSettings`） | `active_profile`、`invert_layout`、`analog_mode`（按 profile id 索引的表） |
+
+取值顺序：**覆盖值 > `bluetooth.lua` > 内置默认**，由 `BluetoothController:override(key, fallback)`
+统一实现 —— 只在覆盖值为 `nil` 时回退，所以显式的 `false` 不会被误当作"未设置"。
+
+### 后果：菜单改过的项，改 bluetooth.lua 不再生效
+
+`invert_layout`、`active_profile`、`use_analog_mode` 三项一旦在菜单里点过，
+就以覆盖文件为准。要改回由 `bluetooth.lua` 决定，删掉覆盖文件里对应的键，
+或直接删掉整个 `<settings>/bluetooth_controller.lua`。
+
+这是 KOReader 自己的模型（`defaults.lua` 给默认、`settings.reader.lua` 存覆盖）。
+
+### 拆分顺带删掉的代码
+
+`LuaSettings:flush()`（`luasettings.lua:270`）本身就是
+`backup()` + `writeToFile(dump(data, nil, true), file, true, true, dir_updated)`，
+和插件此前手写的那套一字不差。所以：
+
+- `writeConfigAtomically`（14 行）→ 删
+- `saveFullConfig`（13 行）→ 删
+- `_config_loaded` 闸门 → 删（`bluetooth.lua` 根本不再被写，无从覆盖）
+- `setCommonSetting` / `setActiveProfileSetting`（16 行）→ 合并为 `saveOverride` + `saveAnalogMode`（11 行）
+
+### 陷阱：读覆盖值不能用 `or`
+
+```lua
+-- 错：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
+local mode = overrides[profile_id] or profile.use_analog_mode
+-- 对：
+local mode = overrides[profile_id]
+if mode == nil then mode = profile.use_analog_mode end
+```
 
 ---
 
