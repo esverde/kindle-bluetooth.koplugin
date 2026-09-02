@@ -22,11 +22,6 @@ local POWER_RESET_INTERVAL = 60
 local STATE_CACHE_INTERVAL = 2
 local DEFAULT_PROFILE = "xbox_wireless_controller"
 
-local SYSTEM_DEVICE_NAMES = {
-    "pt_mt", "goodix-ts", "bd71828-pwrkey", "max77696-onkey",
-    "gpio-keys", "hall_sensor", "accel", "bma4xy_feature", "stylus-custom",
-}
-
 local DUMP_TARGETS = {
     { directory = "/mnt/us", patterns = {
         "^audiomgrd_.*%.core$", "^btmanagerd_.*%.core$", "^Indexer_Dump_.*%.txt$",
@@ -65,13 +60,6 @@ end
 
 local function isDevicePath(path)
     return type(path) == "string" and path:match("^/dev/input/event%d+$") ~= nil
-end
-
-local function nameMatches(lower_name, keywords)
-    for _, keyword in ipairs(keywords) do
-        if lower_name:find(keyword, 1, true) then return true end
-    end
-    return false
 end
 
 local BluetoothController = WidgetContainer:extend {
@@ -157,7 +145,6 @@ function BluetoothController:applyConfig()
         return false
     end
 
-    -- 旧节点由 openDevice 的"换了节点先关旧的"统一处理，这里不重复
     self.wakeup_delay = isNumberInRange(common.wakeup_delay, 1, 60)
         and common.wakeup_delay or self.wakeup_delay
     self.trigger_cooldown_ms = isNumberInRange(common.trigger_cooldown_ms, 0, 60000)
@@ -185,9 +172,8 @@ function BluetoothController:applyConfig()
     return true
 end
 
--- 先写 .tmp 再 rename 覆盖：同一文件系统上 rename 是原子的，
--- 所以 tmp 写成功之后不需要回滚路径。
--- 备份只在原文件 60 秒内没被改过时留（同 LuaSettings:backup），避免覆盖掉刚写的那份。
+-- 先写 .tmp 再 rename：同文件系统上 rename 原子，故 tmp 写成功后无需回滚。
+-- 备份只在原文件 60 秒内未被改过时留（同 LuaSettings:backup），免得覆盖掉刚写的那份。
 local function writeConfigAtomically(path, data)
     local temporary_path = path .. ".tmp"
     local ok, err = util.writeToFile("return " .. data, temporary_path, true, false, true)
@@ -259,9 +245,7 @@ function BluetoothController:onToggleKeyRepeat()
     end)
 end
 
--- 返回 (库, 掩码表)；掩码要等 cdefs 加载后才能取，故一并缓存。
--- SCAN_ONLY 很关键：不带它 FBInk 会真的打开设备并把 fd 塞进返回值，
--- 而我们只是做判定，那个 fd 没人接管就是泄漏。
+-- 掩码要等 cdefs 加载后才能取，故与库一并缓存
 local function getFBInkInput()
     if _fbink_input_checked then return _fbink_input, _fbink_input_masks end
     _fbink_input_checked = true
@@ -278,19 +262,16 @@ local function getFBInkInput()
         return nil
     end
     _fbink_input = library
-    -- 要求命中 JOYSTICK/DPAD 已经把电源键、加速度计、翻页键等全排除了，
-    -- 只有触屏需要显式排除：它也会报 ABS_X/ABS_Y
+    -- 要求命中 JOYSTICK/DPAD 就足以排掉全部 Kindle 内建设备（Scribe 实测：电源键、
+    -- 加速度计、手写笔、触屏各自是 KEY/ACCELEROMETER/TABLET/TOUCHSCREEN），
+    -- 所以不需要设备名黑名单；触屏另行排除是因为它也报 ABS_X/ABS_Y。
+    -- SCAN_ONLY 不能省：不带它 FBInk 会真打开设备，那个 fd 没人接管就是泄漏。
     _fbink_input_masks = {
         match = bit.bor(C.INPUT_JOYSTICK, C.INPUT_DPAD),
         exclude = C.INPUT_TOUCHSCREEN,
         settings = bit.bor(C.NO_RECAP, C.SCAN_ONLY),
     }
     return _fbink_input, _fbink_input_masks
-end
-
--- FBInk 认它是手柄，且名字不在 Kindle 内建设备名单里
-local function isControllerName(matched, name)
-    return matched == true and not nameMatches(name:lower(), SYSTEM_DEVICE_NAMES)
 end
 
 function BluetoothController:isControllerDevice(path)
@@ -301,9 +282,9 @@ function BluetoothController:isControllerDevice(path)
         path, masks.match, masks.exclude, masks.settings)
     if not ok or device == nil then return false end
 
-    local is_controller = isControllerName(device.matched, ffi.string(device.name))
+    local matched = device.matched == true
     C.free(device)
-    return is_controller
+    return matched
 end
 
 
@@ -314,19 +295,18 @@ function BluetoothController:openDevice(is_reload)
         return false
     end
 
-    -- 换了节点先关旧的
     if self.opened_path and self.opened_path ~= path
         and not self:closeDevice(self.opened_path) then
         return false
     end
 
     local was_open = self:isDeviceOpened(path)
-    -- FBInk 打得开并认出是手柄，就同时证明了节点存在，不必再单独 stat 一次
+    -- FBInk 能分类它就已证明节点存在，不必再 stat 一次
     local usable = self:isControllerDevice(path)
 
-    -- 节点不可用时关闭是硬要求：留着死 fd 会让 handleInputEvent 的闸门永远
-    -- 指向一个不存在的设备，不重启无法恢复。代价是唤醒瞬间的偶发失败会丢一个
-    -- 还在工作的 fd，但那一侧可由下次唤醒或「重新加载设备」恢复。
+    -- 节点不可用时必须关：留着死 fd 会让 handleInputEvent 的闸门永远指向一个
+    -- 不存在的设备，不重启无法恢复。代价是偶发的 open 失败会丢一个还在工作的
+    -- fd，但那一侧能靠下次唤醒或「重新加载设备」恢复 —— 选可恢复的那一侧。
     if was_open and (is_reload or not usable) then
         if not self:closeDevice(path) then return false end
         was_open = false
@@ -386,8 +366,7 @@ function BluetoothController:isDeviceOpened(path)
     return Device.input.opened_devices[path] ~= nil
 end
 
--- fbink_input_scan 一次遍历所有 /dev/input 节点并连名字一起返回，
--- 不需要自己走 sysfs（写法同 koreader externalkeyboard.koplugin 的 findKeyboards）
+-- fbink_input_scan 会返回*全部* /dev/input 节点（含名字），命中与否看 matched
 function BluetoothController:scanJoystickDevices()
     local devices = {}
     local library, masks = getFBInkInput()
@@ -401,7 +380,7 @@ function BluetoothController:scanJoystickDevices()
     for i = 0, tonumber(count[0]) - 1 do
         local device = found[i]
         local name = ffi.string(device.name)
-        if isControllerName(device.matched, name) then
+        if device.matched then
             local path = ffi.string(device.path)
             local is_opened = self:isDeviceOpened(path)
             table.insert(devices, { path = path, name = name, opened = is_opened })
@@ -415,7 +394,7 @@ function BluetoothController:scanJoystickDevices()
 end
 
 
--- KindlePowerD 已经持有一个长驻 lipc 句柄；自己 init+close 一个反而比它想省掉的 fork 更贵
+-- 复用 KindlePowerD 的长驻句柄；自己 init+close 一个比它想省的 fork 更贵
 local function btLipc()
     local powerd = Device:getPowerDevice()
     return powerd and powerd.lipc_handle
@@ -481,8 +460,6 @@ function BluetoothController:onToggleBluetooth()
     return true
 end
 
--- 用方法引用而非闭包排程：unschedule 按函数本身匹配并清掉全部待执行项
--- （uimanager.lua:440），所以不需要自己存任务句柄
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
     if self:reloadDevice() then
@@ -490,23 +467,24 @@ function BluetoothController:_reconnect()
     end
 end
 
--- unschedule 必须和 scheduleIn 成对出现，否则重连任务会堆叠；只在这里成对写一次
+-- unschedule 与 scheduleIn 必须成对，否则重连任务会堆叠；只在这里成对写一次。
+-- 用方法引用而非闭包：unschedule 按函数本身匹配（uimanager.lua:440），
+-- 一次调用就能清掉全部待执行项，不需要自己存任务句柄。
 function BluetoothController:scheduleReconnect(delay)
     UIManager:unschedule(self._reconnect)
     UIManager:scheduleIn(delay, self._reconnect, self)
 end
 
--- koreader-base 的 uevent 监听器（input/input-kindle.h:95）对任何
--- SUBSYSTEM=input、DEVNAME=input/eventN 的 add/remove 都发事件 —— 不限 UHID，
--- 所以手柄一连上就能立刻接管，不必等唤醒后盲试。
--- 延迟 0.5 秒是因为节点刚建好时驱动可能还没就绪（externalkeyboard.koplugin 同样等 0.5s）。
+-- uevent 监听器（koreader-base input/input-kindle.h:95）对任何 input/eventN 的
+-- add/remove 都发事件，不限 UHID —— 原生蓝牙栈实测有效。
+-- 等 0.5 秒是因为节点刚建好时驱动可能还没就绪（externalkeyboard.koplugin 同值）。
 function BluetoothController:onEvdevInputInsert(path)
     if path ~= self.config.device_path then return end
     logger.info("BT Plugin: Input device inserted: " .. path)
     self:scheduleReconnect(0.5)
 end
 
--- 节点消失时立刻放掉 fd，不必等下一次 openDevice 去发现它已经死了
+-- 节点消失就立刻放掉 fd，不必等下次 openDevice 去发现它已经死了
 function BluetoothController:onEvdevInputRemove(path)
     if path ~= self.opened_path then return end
     logger.info("BT Plugin: Input device removed: " .. path)
@@ -514,8 +492,8 @@ function BluetoothController:onEvdevInputRemove(path)
     self:closeDevice(path)
 end
 
--- 兜底：手柄的节点若在休眠期间没有重建，就不会有 EvdevInputInsert，
--- 只能靠这次重连把可能已经失效的 fd 换掉
+-- 不是冗余的兜底：实测休眠时 evdev 节点会存活，内核不发 uevent，
+-- 所以上面两个处理函数在唤醒场景下根本不会触发，这里是唯一的重连路径。
 function BluetoothController:onOutOfScreenSaver()
     logger.info("BT Plugin: Device wakeup detected, scheduling reload...")
     self:scheduleReconnect(self.wakeup_delay)
@@ -637,7 +615,6 @@ function BluetoothController:cleanupBluetoothDumps()
         end
     end
 
-    -- 一次 rm 处理全部，别每个文件 fork 一次
     if #paths > 0 then
         local command = "rm -rf -- " .. util.shell_escape(paths) .. " 2>/dev/null"
         if os.execute(command) ~= 0 then
