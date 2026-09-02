@@ -614,15 +614,10 @@ function BluetoothController:cleanupBluetoothDumps()
 end
 
 
-local DEVICE_STATUS = {
-    [true] = {
-        [true]  = { " [当前]",   "已连接并在 KOReader 中打开" },
-        [false] = { " [已配置]", "已配置为此设备（未打开）" },
-    },
-    [false] = {
-        [true]  = { " [已连接]", "已在 KOReader 中打开" },
-        [false] = { " [可用]",   "系统蓝牙已连接（可配置使用）" },
-    },
+-- 索引为 [是否当前配置][是否已在 KOReader 打开]；存原文，_() 在使用处调用
+local DEVICE_TAGS = {
+    [true]  = { [true] = " [当前]",   [false] = " [已配置]" },
+    [false] = { [true] = " [已连接]", [false] = " [可用]" },
 }
 
 function BluetoothController:addToMainMenu(menu_items)
@@ -664,23 +659,11 @@ function BluetoothController:addToMainMenu(menu_items)
                 } }
             end
 
+            -- 节点号直接列出来：那是要填回 bluetooth.lua 的东西，别藏在弹窗里
             local items = {}
             for _i, dev in ipairs(devices) do
-                local is_current = (dev.path == self.config.device_path)
-                local status_tag, status_desc = unpack(DEVICE_STATUS[is_current][dev.opened])
-                status_tag, status_desc = _(status_tag), _(status_desc)
-
-                table.insert(items, {
-                    text = dev.name .. status_tag,
-                    callback = function()
-                        UIManager:show(InfoMessage:new{
-                            text = string.format(
-                                _("设备名称: %s\n设备节点: %s\n连接状态: %s"),
-                                dev.name, dev.path, status_desc),
-                            timeout = 4,
-                        })
-                    end,
-                })
+                local tag = DEVICE_TAGS[dev.path == self.config.device_path][dev.opened]
+                table.insert(items, { text = dev.name .. _(tag) .. "  " .. dev.path })
             end
             return items
         end,
