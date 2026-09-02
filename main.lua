@@ -92,7 +92,6 @@ function BluetoothController:init()
     self:openDevice(false)
 end
 
-
 function BluetoothController:loadSettings()
     self._config_loaded = false
     local loader = loadfile(self.settings_file)
@@ -216,7 +215,6 @@ function BluetoothController:setActiveProfileSetting(key, value)
     return self:saveFullConfig()
 end
 
-
 function BluetoothController:registerInputHook()
     _current_active_controller = self
 
@@ -264,19 +262,20 @@ local function getFBInkInput()
     return _fbink_input, _fbink_input_masks
 end
 
-function BluetoothController:isControllerDevice(path)
+local function isControllerDevice(path)
+    -- 先判存在：节点不在时 FBInk 会往 stderr 打一行错误（docs §1）
+    if lfs.attributes(path, "mode") == nil then return false end
+
     local library, masks = getFBInkInput()
     if not library then return false end
 
-    local ok, device = pcall(library.fbink_input_check,
-        path, masks.match, masks.exclude, masks.settings)
-    if not ok or device == nil then return false end
+    local device = library.fbink_input_check(path, masks.match, masks.exclude, masks.settings)
+    if device == nil then return false end
 
     local matched = device.matched == true
     C.free(device)
     return matched
 end
-
 
 function BluetoothController:openDevice(is_reload)
     local path = self.config.device_path
@@ -291,13 +290,12 @@ function BluetoothController:openDevice(is_reload)
     end
 
     local was_open = self:isDeviceOpened(path)
-    -- 先判存在：节点不在时 FBInk 会往 stderr 打一行错误（docs §1）
-    local usable = lfs.attributes(path, "mode") ~= nil and self:isControllerDevice(path)
+    local usable = isControllerDevice(path)
 
     -- 关闭顺序的权衡见 docs §9
-    if was_open and (is_reload or not usable) then
-        if not self:closeDevice(path) then return false end
-        was_open = false
+    if was_open and (is_reload or not usable)
+        and not self:closeDevice(path) then
+        return false
     end
 
     if not usable then
@@ -305,7 +303,7 @@ function BluetoothController:openDevice(is_reload)
         return false
     end
 
-    if not was_open then
+    if not self:isDeviceOpened(path) then
         resetInputState()
         local ok, err = pcall(Device.input.open, Device.input, path)
         if not (ok and self:isDeviceOpened(path)) then
@@ -328,13 +326,10 @@ function BluetoothController:closeDevice(path)
 
     if self:isDeviceOpened(path) then
         logger.info("BT Plugin: Closing device " .. path)
-        local ok, err = pcall(Device.input.close, Device.input, path)
+        local _, err = pcall(Device.input.close, Device.input, path)
         if self:isDeviceOpened(path) then
             logger.warn("BT Plugin: Failed to close " .. path .. " -> " .. tostring(err or "still open"))
             return false
-        end
-        if not ok then
-            logger.warn("BT Plugin: Close raised on " .. path .. " -> " .. tostring(err))
         end
     end
 
@@ -360,14 +355,13 @@ function BluetoothController:scanJoystickDevices()
     if not library then return devices end
 
     local count = ffi.new("size_t[1]")
-    local ok, found = pcall(library.fbink_input_scan,
-        masks.match, masks.exclude, masks.settings, count)
-    if not ok or found == nil then return devices end
+    local found = library.fbink_input_scan(masks.match, masks.exclude, masks.settings, count)
+    if found == nil then return devices end
 
     for i = 0, tonumber(count[0]) - 1 do
         local device = found[i]
-        local name = ffi.string(device.name)
         if device.matched then
+            local name = ffi.string(device.name)
             local path = ffi.string(device.path)
             local is_opened = self:isDeviceOpened(path)
             table.insert(devices, { path = path, name = name, opened = is_opened })
@@ -379,7 +373,6 @@ function BluetoothController:scanJoystickDevices()
     table.sort(devices, function(left, right) return left.path < right.path end)
     return devices
 end
-
 
 local function btLipc()
     local powerd = Device:getPowerDevice()
@@ -438,7 +431,6 @@ function BluetoothController:onDispatcherRegisterActions()
     })
 end
 
-
 function BluetoothController:onToggleBluetooth()
     self:setBluetoothState(not self:getDisplayState())
     return true
@@ -465,7 +457,6 @@ function BluetoothController:onEvdevInputRemove(path)
     UIManager:unschedule(self._reconnect)
     self:closeDevice(path)
 end
-
 
 function BluetoothController:pokeActivity()
     if not _shared_last_power_reset_time
@@ -567,7 +558,6 @@ function BluetoothController:parseAnalogInput(ev)
     end
 end
 
-
 function BluetoothController:cleanupBluetoothDumps()
     local paths = {}
     for _, target in ipairs(DUMP_TARGETS) do
@@ -591,7 +581,6 @@ function BluetoothController:cleanupBluetoothDumps()
     logger.info("BT Plugin: Cleaned up bluetooth dump files")
     return true
 end
-
 
 -- [是否当前配置][是否已打开]；存原文，_() 在使用处调用
 local DEVICE_TAGS = {
