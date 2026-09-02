@@ -92,8 +92,6 @@ local BluetoothController = WidgetContainer:extend {
 
     _state_cached = false,
     _state_time = nil,
-
-    _wakeup_task = nil,
 }
 
 function BluetoothController:init()
@@ -487,22 +485,40 @@ function BluetoothController:onToggleBluetooth()
     return true
 end
 
+-- 用方法引用而非闭包排程：unschedule 按函数本身匹配并清掉全部待执行项
+-- （uimanager.lua:440），所以不需要自己存任务句柄
+function BluetoothController:_reconnect()
+    if _current_active_controller ~= self then return end
+    if self:reloadDevice() then
+        UIManager:show(InfoMessage:new{ text = _("BT Controller Reconnected"), timeout = 2 })
+    end
+end
+
+-- koreader-base 的 uevent 监听器（input/input-kindle.h:95）对任何
+-- SUBSYSTEM=input、DEVNAME=input/eventN 的 add/remove 都发事件 —— 不限 UHID，
+-- 所以手柄一连上就能立刻接管，不必等唤醒后盲试。
+-- 延迟 0.5 秒是因为节点刚建好时驱动可能还没就绪（externalkeyboard.koplugin 同样等 0.5s）。
+function BluetoothController:onEvdevInputInsert(path)
+    if path ~= self.config.device_path then return end
+    logger.info("BT Plugin: Input device inserted: " .. path)
+    UIManager:unschedule(self._reconnect)
+    UIManager:scheduleIn(0.5, self._reconnect, self)
+end
+
+-- 节点消失时立刻放掉 fd，不必等下一次 openDevice 去发现它已经死了
+function BluetoothController:onEvdevInputRemove(path)
+    if path ~= self.opened_path then return end
+    logger.info("BT Plugin: Input device removed: " .. path)
+    UIManager:unschedule(self._reconnect)
+    self:closeDevice(path)
+end
+
+-- 兜底：手柄的节点若在休眠期间没有重建，就不会有 EvdevInputInsert，
+-- 只能靠这次重连把可能已经失效的 fd 换掉
 function BluetoothController:onOutOfScreenSaver()
     logger.info("BT Plugin: Device wakeup detected, scheduling reload...")
-    if self._wakeup_task then
-        UIManager:unschedule(self._wakeup_task)
-        self._wakeup_task = nil
-    end
-
-    local task
-    task = function()
-        if self._wakeup_task == task then self._wakeup_task = nil end
-        if self:reloadDevice() then
-            UIManager:show(InfoMessage:new{ text = _("BT Controller Reconnected"), timeout = 2 })
-        end
-    end
-    self._wakeup_task = task
-    UIManager:scheduleIn(self.wakeup_delay, task)
+    UIManager:unschedule(self._reconnect)
+    UIManager:scheduleIn(self.wakeup_delay, self._reconnect, self)
 end
 
 
@@ -824,10 +840,7 @@ function BluetoothController:addToMainMenu(menu_items)
 end
 
 function BluetoothController:onExit()
-    if self._wakeup_task then
-        UIManager:unschedule(self._wakeup_task)
-        self._wakeup_task = nil
-    end
+    UIManager:unschedule(self._reconnect)
     if _current_active_controller == self then
         self:closeDevice()
         _current_active_controller = nil

@@ -6,6 +6,7 @@ info/
 test/
 log/
 koreader/
+koreader-base/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
