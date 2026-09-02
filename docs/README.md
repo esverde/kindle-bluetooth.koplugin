@@ -38,8 +38,14 @@
 修改 profile 或设备路径后，应通过菜单重新加载设备。插件会先释放旧节点，再打开新节点。
 
 配置加载会校验 profile 结构、输入节点格式和数值范围。非法配置不会替换当前运行配置；
-冷却时间和轴阈值越界时使用默认值。插件不会自动修改 `device_path`，
-设备节点需要手动维护 —— 用菜单里的「已连接设备」查真实节点号。
+冷却时间和轴阈值越界时使用默认值。插件不会自动修改 `device_path`，设备节点需要手动维护。
+
+**查真实节点号**：菜单「已连接设备」只显示名称与状态标签，节点号看 `crash.log`：
+
+```sh
+grep "Found input device" /mnt/us/koreader/crash.log
+# BT Plugin: Found input device: Xbox Wireless Controller at /dev/input/event6 (opened=true)
+```
 
 ⚠️ **回写会抹掉注释**。任何一次改设置（反转方向、摇杆模式、切换配置）
 都会用 `dump` 重写整个文件，手写的注释不会保留。想留注释请另存一份。
@@ -108,6 +114,19 @@ event6: `Xbox Wireless Controller`  = JOYSTICK | KEY      ← 唯一命中
 这类模糊匹配，才会把内建设备捞进来），换成 FBInk 后从未生效过。
 
 `INPUT_TOUCHSCREEN` 仍需显式排除：触屏也报 `ABS_X`/`ABS_Y`，轴码与摇杆冲突。
+
+### 节点不存在时会往 stderr 打错误
+
+`fbink_input_check` 打不开路径时会输出
+
+```
+[FBInk] [fbink_input_check] open `/dev/input/event6`: No such file or directory!
+```
+
+`NO_RECAP` 挡不住这一行（那只挡分类结果的 recap）。手柄没连时每次 `openDevice`
+（含每次打开文档）都会写一行。所以 `openDevice` 在调用分类器前先用
+`lfs.attributes` 判一次存在 —— 对功能是冗余的（FBInk 会返回 NULL），
+但能免掉这行噪音和一次注定失败的库调用。
 
 ### SCAN_ONLY 不能省
 
@@ -268,6 +287,61 @@ with an evdev device node… We intentionally don't filter on devpath"。
 - stdout/stderr 全部重定向进 `crash.log`，上限 500KB（`koreader.sh:334`：
   `./reader.lua "$@" >>crash.log 2>&1`）。
 - 设备上路径：`/mnt/us/koreader/crash.log`，过滤用 `grep "BT Plugin"`。
+
+### 这两行不是错误
+
+```
+[ko-input] Closed input device with fd: 16 @ idx: 4 (matched by idx)
+WARN  Polling for input events returned an error: 19 -> No such device
+```
+
+设备消失时的**正常流程**，KOReader 源码里明确预期了这条路径。`errno 19` 是
+`ENODEV`；ko-input 的 `waitForInput` 捕获它并在 C 层自行关掉 fd
+（`matched by idx` = 内部按数组下标清理，`matched by fd` = Lua 侧显式请求关闭）。
+
+随后插件的 `closeDevice` 调 `Input:close(path)`，C 层返回 `(false, ENODEV)`，
+而 `input.lua:389` 的包装函数把这种情况**当成成功**并清掉表项 —— 它的注释原文：
+
+```lua
+if ok or err == C.ENODEV then
+    -- Either the call succeeded,
+    -- or the backend had already caught an ENODEV in waitForInput and closed the fd internally.
+    -- (Because the EvdevInputRemove Event comes from an UsbDevicePlugOut uevent forwarded as an... *input* EV_KEY event ;)).
+    -- Regardless, that device is gone, so clear its spot in the hashmap.
+```
+
+注释里直接点了 `EvdevInputRemove` —— 也就是本插件走的正是上游设计好的那条路。
+
+## §9 代码中不显然的取舍
+
+代码里只留一行指针，理由在这里。
+
+### openDevice 的关闭顺序（最容易被"优化"回去的一处）
+
+发现节点不可用时，**先关闭旧 fd 再验证**，而不是先验证再关闭。
+
+| 顺序 | 失败时的后果 |
+| --- | --- |
+| 先关后验（现状） | 偶发的 open 失败会丢一个还在工作的 fd —— 下次插拔事件或「重新加载设备」即可恢复 |
+| 先验后关 | 节点已消失时会保留死 fd，`isDeviceOpened` 永远为真，输入闸门一直指向不存在的设备 —— **不重启无法恢复** |
+
+选可恢复的那一侧。这个顺序被两轮 code review 给出过相反结论，改动前请先读这张表。
+
+### 其余各处
+
+| 代码位置 | 取舍 |
+| --- | --- |
+| `RECONNECT_SETTLE_DELAY = 0.5` | 节点刚建好时驱动可能还没就绪；与 `externalkeyboard.koplugin` 取同值。这是硬件时序旋钮，机器不同可能要调 |
+| `isNumberInRange` | 不单独判 NaN/±inf —— 它们过不了 `>=` / `<=` 比较 |
+| `applyConfig` 的字段归一化 | 全局唯一的配置校验点，因此输入热路径（`parseInputDirection` 及以下）不再逐字段查类型 |
+| `opened_fd` 字段 | 开设备时记下 fd，输入热路径上省一次表查。每次 open 后必须重读 —— 实测同一手柄在不同会话里拿到过 13 和 16 |
+| `handleInputEvent` 的 fd 闸门 | 只认手柄那一个 fd，触屏事件在此被挡住，所以不需要额外的 `ABS_MT`（轴码 ≥ 47）预过滤。保留 `not self.opened_fd or` 判空是因为无法证明不存在 `ev.fd == nil` 的事件路径 |
+| `closeDevice` 无参调用 | 只关自己开过的节点（回退到 `opened_path`，不回退到 `config.device_path`），别去动别人的 fd |
+| `onEvdevInputInsert` 里先 `unschedule` | 快速插拔时才不会堆叠出多个重连任务 |
+| `onEvdevInputRemove` 立刻关闭 | 节点消失就放掉 fd，不必等下一次 `openDevice` 去发现它已经死了 |
+| `btLipc` | 复用 KindlePowerD 的长驻句柄；自己 `lipc.init()` + `close()` 一个比它想省掉的 fork 更贵 |
+| `trigger_cooldown_ms` 在类表上 | 默认值的唯一归宿，`applyConfig` 只在配置里有合法值时覆盖 |
+| `DEVICE_TAGS` 存原文 | `_()` 在使用处调用；模块只加载一次，在表里翻译会把语言冻结在加载时刻 |
 
 ---
 
