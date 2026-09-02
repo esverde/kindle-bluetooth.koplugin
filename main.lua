@@ -21,6 +21,8 @@ local AXIS_THRESHOLD_DEFAULT = 16384
 local POWER_RESET_INTERVAL = 60
 local STATE_CACHE_INTERVAL = 2
 local DEFAULT_PROFILE = "xbox_wireless_controller"
+-- 节点刚建好时驱动可能还没就绪，等一下再打开（externalkeyboard.koplugin 同值）
+local RECONNECT_SETTLE_DELAY = 0.5
 
 local DUMP_TARGETS = {
     { directory = "/mnt/us", patterns = {
@@ -75,7 +77,6 @@ local BluetoothController = WidgetContainer:extend {
     opened_fd = nil,   -- 开设备时记下，输入热路径上省一次表查
 
     -- 默认值的唯一归宿
-    wakeup_delay = 3,
     trigger_cooldown_ms = 500,
 
     _state_cached = false,
@@ -145,8 +146,6 @@ function BluetoothController:applyConfig()
         return false
     end
 
-    self.wakeup_delay = isNumberInRange(common.wakeup_delay, 1, 60)
-        and common.wakeup_delay or self.wakeup_delay
     self.trigger_cooldown_ms = isNumberInRange(common.trigger_cooldown_ms, 0, 60000)
         and common.trigger_cooldown_ms or self.trigger_cooldown_ms
     self.active_profile = active_profile
@@ -467,21 +466,16 @@ function BluetoothController:_reconnect()
     end
 end
 
--- unschedule 与 scheduleIn 必须成对，否则重连任务会堆叠；只在这里成对写一次。
--- 用方法引用而非闭包：unschedule 按函数本身匹配（uimanager.lua:440），
--- 一次调用就能清掉全部待执行项，不需要自己存任务句柄。
-function BluetoothController:scheduleReconnect(delay)
-    UIManager:unschedule(self._reconnect)
-    UIManager:scheduleIn(delay, self._reconnect, self)
-end
-
 -- uevent 监听器（koreader-base input/input-kindle.h:95）对任何 input/eventN 的
--- add/remove 都发事件，不限 UHID —— 原生蓝牙栈实测有效。
--- 等 0.5 秒是因为节点刚建好时驱动可能还没就绪（externalkeyboard.koplugin 同值）。
+-- add/remove 都发事件，不限 UHID —— 原生蓝牙栈实测有效，掉线/重连全靠这两个事件。
+-- 没有唤醒定时重连：实测休眠时节点存活则 fd 仍可用，节点被销毁则重连时会发 insert，
+-- 两种情况都不需要按时间盲试。
 function BluetoothController:onEvdevInputInsert(path)
     if path ~= self.config.device_path then return end
     logger.info("BT Plugin: Input device inserted: " .. path)
-    self:scheduleReconnect(0.5)
+    -- unschedule 先行，快速插拔时才不会堆叠出多个重连任务
+    UIManager:unschedule(self._reconnect)
+    UIManager:scheduleIn(RECONNECT_SETTLE_DELAY, self._reconnect, self)
 end
 
 -- 节点消失就立刻放掉 fd，不必等下次 openDevice 去发现它已经死了
@@ -490,13 +484,6 @@ function BluetoothController:onEvdevInputRemove(path)
     logger.info("BT Plugin: Input device removed: " .. path)
     UIManager:unschedule(self._reconnect)
     self:closeDevice(path)
-end
-
--- 不是冗余的兜底：实测休眠时 evdev 节点会存活，内核不发 uevent，
--- 所以上面两个处理函数在唤醒场景下根本不会触发，这里是唯一的重连路径。
-function BluetoothController:onOutOfScreenSaver()
-    logger.info("BT Plugin: Device wakeup detected, scheduling reload...")
-    self:scheduleReconnect(self.wakeup_delay)
 end
 
 
@@ -758,32 +745,6 @@ function BluetoothController:addToMainMenu(menu_items)
             joystickModeItem(_("模拟摇杆"), true),
             joystickModeItem(_("方向键"), false),
         }
-    })
-
-    table.insert(sub_items, {
-        text = _("唤醒延迟"),
-        keep_menu_open = true,
-        callback = function()
-            local SpinWidget = require("ui/widget/spinwidget")
-            UIManager:show(SpinWidget:new{
-                title_text = _("设置唤醒延迟（秒）"),
-                value = self.wakeup_delay,
-                value_min = 1,
-                value_max = 10,
-                value_step = 1,
-                value_hold_step = 2,
-                ok_text = _("确定"),
-                callback = function(spin)
-                    self.wakeup_delay = spin.value
-                    self:setCommonSetting("wakeup_delay", spin.value)
-
-                    UIManager:show(InfoMessage:new{
-                        text = _("唤醒延迟已设置为 ") .. spin.value .. _(" 秒"),
-                        timeout = 2
-                    })
-                end
-            })
-        end,
     })
 
     table.insert(sub_items, {

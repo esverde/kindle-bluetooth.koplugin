@@ -17,7 +17,6 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| `common.wakeup_delay` | Kindle 唤醒后重新连接设备前的等待秒数。 |
 | `common.trigger_cooldown_ms` | 两次翻页触发之间的最小间隔，单位为毫秒。 |
 | `common.invert_layout` | 是否反转上一页/下一页方向。 |
 | `common.active_profile` | 当前使用的 profile ID。 |
@@ -39,10 +38,10 @@
 修改 profile 或设备路径后，应通过菜单重新加载设备。插件会先释放旧节点，再打开新节点。
 
 配置加载会校验 profile 结构、输入节点格式和数值范围。非法配置不会替换当前运行配置；
-唤醒延迟、冷却时间和轴阈值越界时使用默认值。插件不会自动修改 `device_path`，
+冷却时间和轴阈值越界时使用默认值。插件不会自动修改 `device_path`，
 设备节点需要手动维护 —— 用菜单里的「已连接设备」查真实节点号。
 
-⚠️ **回写会抹掉注释**。任何一次改设置（反转方向、摇杆模式、唤醒延迟、切换配置）
+⚠️ **回写会抹掉注释**。任何一次改设置（反转方向、摇杆模式、切换配置）
 都会用 `dump` 重写整个文件，手写的注释不会保留。想留注释请另存一份。
 
 ## 输入设备边界
@@ -63,7 +62,7 @@ KOReader。这是 in-app 版的 evdev 独占（grab）：不消费的话，"上�
 
 - 插件**每个 ReaderUI 实例化一次**（打开文档时日志会再打一遍 `Loaded profile`）。
   模块级的 `_current_active_controller` 指向当前实例，hook 只注册一次并委派给它。
-- 切换 profile、唤醒重连、重新加载设备时，日志出现"关闭旧节点再打开新节点"是正常流程。
+- 切换 profile、事件驱动重连、重新加载设备时，日志出现"关闭旧节点再打开新节点"是正常流程。
 - 日志里的 `idx` 是 KOReader 内部输入设备数组下标，不是 `/dev/input/eventN`。
 - `[ko-input] Forked off fake event generator` 是 KOReader 的电源/屏幕/热插拔事件基础设施，
   不是手柄设备，不要动它。
@@ -77,6 +76,7 @@ KOReader。这是 in-app 版的 evdev 独占（grab）：不消费的话，"上�
   往回跳时把节流窗口永久冻住（差值变负数，恒小于阈值）。
 - 模拟摇杆同时使用"回到死区"和时间冷却两层去抖。
 - 蓝牙状态查询带 2 秒缓存，避免菜单每次重绘都 fork 一个进程。
+- 手柄掉线与重连**完全由 uevent 事件驱动**，没有任何定时轮询或唤醒重连（见 §3）。
 - 只有成功读取过配置文件才允许回写（`_config_loaded` 闸门）。否则配置文件缺失或损坏时，
   第一次菜单操作就会把整份 profiles 覆盖成 `{common={...}}`。
 - 配置先写 `.tmp` 并 fsync，再 `rename` 原子替换；原文件 60 秒内未被改过时留 `.old` 备份。
@@ -159,31 +159,59 @@ with an evdev device node… We intentionally don't filter on devpath"。
 （`[ko-input] Closed input device … (matched by idx)`），但它**不会清 Lua 侧的
 `Input.opened_devices`**，所以插件的 `closeDevice` 仍需执行。两条路径汇合正常，无报错。
 
-## §3 休眠唤醒：节点存活，不发 uevent
+## §3 休眠唤醒：不需要定时重连
 
-**设备实测**（33 秒休眠，手柄保持连接）：
+结论：**插件没有唤醒后按时间重连的逻辑，两种休眠情形都由 §2 的事件覆盖。**
+
+### 情形 A：手柄未掉线（33 秒短休眠实测）
 
 ```
 20:14:43  Inhibiting user input                              ← 进入休眠
-20:15:16  BT Plugin: Device wakeup detected, scheduling reload...
-20:15:19  BT Plugin: Closing device /dev/input/event6        ← +3s = wakeup_delay
-20:15:19  BT Plugin: Opened device /dev/input/event6
+20:15:19  （无 removed / inserted 事件）
 ```
 
-关键在于**没有** `Input device inserted:` / `removed:` —— `/dev/input/event6`
-在休眠期间**存活了下来**，内核不发 uevent，§2 的两个事件处理函数在唤醒场景下
-**根本不会触发**。
+`/dev/input/event6` 在休眠期间**存活**，fd 仍然可用 —— 什么都不需要做。
 
-**所以 `onOutOfScreenSaver` 不是冗余兜底，而是唤醒时唯一的重连路径**，
-`wakeup_delay` 也是必要的校准旋钮（蓝牙栈恢复耗时每台机器不同）。
+### 情形 B：手柄在休眠期间掉线（两个周期实测）
 
-这条曾被我判为"可删 25 行"，被这次实测推翻。两条路径的分工：
+```
+20:25:19  Inhibiting user input
+20:26:54  Input device removed: /dev/input/event6      ← 休眠 95 秒后掉线
+20:26:54  Closing device /dev/input/event6
+[ko-input] Closed input device with fd: 13 (matched by fd)
+20:29:04  （唤醒）
+20:29:10  Input device inserted: /dev/input/event6      ← 手柄重连
+20:29:10  Opened device /dev/input/event6
 
-| 场景 | 生效机制 |
-| --- | --- |
-| 运行中手柄掉线/重连 | `EvdevInputRemove` + `EvdevInputInsert` |
-| 休眠唤醒（节点存活） | `onOutOfScreenSaver` 定时重连 |
-| 休眠期间掉线 | 两者都可能，取决于 uevent 能否跨休眠投递（未测） |
+第二个周期：休眠 94 秒后 removed，唤醒后 1 秒 inserted → Opened
+```
+
+两个关键事实：
+
+1. **`remove` uevent 跨休眠正常投递** —— 休眠约 95 秒后准时打出，说明掉线那一刻
+   CPU 与 uevent 监听器子进程都还活着。此前担心的"uevent 跨休眠丢失"不存在。
+   fd 被干净释放（`matched by fd` 表示是插件主动关的，不是 ko-input 的错误清理）。
+2. **重连由 `EvdevInputInsert` 完成**，时机取决于蓝牙链路何时恢复
+   （实测唤醒后 1~6 秒）。深度休眠期间蓝牙栈挂起，手柄连不上，
+   所以重连必然发生在唤醒之后 —— 正是 insert 事件的射程之内。
+
+### 曾经存在的 onOutOfScreenSaver（已删除）
+
+早先有一个"唤醒后按 `wakeup_delay` 秒定时重连"的兜底，实测证明它无用且有害：
+
+- 情形 A：手柄没断，那次 close+reopen 纯属浪费，还会弹一个多余的
+  "BT Controller Reconnected" 提示。
+- 情形 B 周期 1：定时任务在 +3 秒跑，此时节点尚未创建 → 失败，
+  并在日志里留下 `[FBInk] [fbink_input_check] open ...: No such file or directory!` 噪音。
+- 情形 B 周期 2：insert 事件在 +1 秒先到，`unschedule` 把定时任务直接取消 → 从未执行。
+
+**三种情形里它一次都没起过作用。** 万一遇到未知边缘情况，菜单里的
+「重新加载设备」是一键补救，不需要为此保留自动化。
+
+（历史记录：这段代码的必要性被反复误判过三次 —— 先说它是唯一重连路径、
+再说它回收陈旧 fd、再说它防 uevent 丢失。三个理由分别被"日志区分不了必要与
+运行"、"`openDevice` 每次打开文档都会自愈"、"remove uevent 实测正常投递"推翻。
+换三个理由去保一段代码，本身就是该删的信号。）
 
 ## §4 UIManager 排程
 
@@ -275,7 +303,8 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 | 打开 | 同上（`init` 里就会开） | `Opened device /dev/input/eventN` |
 | 扫描 | 菜单 → 工具 → 蓝牙翻页器 → 已连接设备 | `Found input device: … (opened=true)`，且**只列手柄** |
 | 热插拔 | 关手柄，等 3 秒，再开 | `Input device removed:` → `Input device inserted:` → `Opened device` |
-| 休眠 | 合盖/电源键，唤醒 | `Device wakeup detected` → `Closing device` → `Opened device` |
+| 休眠（手柄不断） | 短休眠后唤醒 | **无**任何 BT Plugin 日志；手柄直接可用 |
+| 休眠（手柄掉线） | 休眠 2 分钟以上再唤醒 | 休眠中 `Input device removed:`；唤醒后 `Input device inserted:` → `Opened device` |
 
 功能验证：摇杆推一下能翻页，**且触屏依然正常**（后者验证 fd 闸门 ——
 触屏失灵说明 `opened_fd` 匹配错了，事件被误吃）。

@@ -1,7 +1,6 @@
 
 return {
     common = {
-        wakeup_delay = 3,
         trigger_cooldown_ms = 500,
         invert_layout = false,
         active_profile = "xbox_wireless_controller",
