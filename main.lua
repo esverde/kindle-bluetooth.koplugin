@@ -17,11 +17,8 @@ local Input = require("device/input")
 local bit = require("bit")
 local C = ffi.C
 
-local AXIS_CENTER_DEFAULT = 32768
-local AXIS_THRESHOLD_DEFAULT = 16384
 local POWER_RESET_INTERVAL = 60
 local STATE_CACHE_INTERVAL = 2
-local DEFAULT_PROFILE = "xbox_wireless_controller"
 local RECONNECT_SETTLE_DELAY = 0.5  -- docs §9
 
 local DUMP_TARGETS = {
@@ -63,12 +60,10 @@ local BluetoothController = WidgetContainer:extend {
 
     config = {},
     file_config = {},   -- bluetooth.lua 的内容，只读
-    settings = nil,     -- 菜单可改的三个覆盖值，见 docs §10
+    settings = nil,     -- 菜单可改的两个覆盖值，见 docs §10
 
     opened_path = nil,
     opened_fd = nil,
-
-    trigger_cooldown_ms = 500,
 
     _state_cached = false,
     _state_time = nil,
@@ -91,7 +86,7 @@ end
 function BluetoothController:loadSettings()
     local loader = loadfile(self.path .. "/bluetooth.lua")
     if not loader then
-        logger.warn("BT Plugin: Config file missing or unparsable, using defaults")
+        logger.warn("BT Plugin: bluetooth.lua missing or unparsable")
         return false
     end
 
@@ -110,64 +105,56 @@ function BluetoothController:loadSettings()
     return true
 end
 
--- 取值顺序：菜单写的覆盖值 > bluetooth.lua > 内置默认
-function BluetoothController:override(key, fallback)
+-- 取值顺序：菜单写的覆盖值 > bluetooth.lua。不存在第三层兜底。
+function BluetoothController:override(key, from_file)
     local value = self.settings:readSetting(key)
-    if value == nil then return fallback end
+    if value == nil then return from_file end
     return value
 end
 
+-- 全部字段必填且必须合法，任何一项不过关就整份拒绝（docs §10）。
+-- 这是唯一的校验点，通过之后输入热路径可以直接索引，不再逐字段重查。
 function BluetoothController:applyConfig()
-    local common = self.file_config.common
-    if common ~= nil and type(common) ~= "table" then
-        logger.warn("BT Plugin: Invalid common configuration")
-        return false
-    end
-    common = common or {}
-
-    local profiles = self.file_config.profiles
-    if type(profiles) ~= "table" then
-        logger.warn("BT Plugin: Missing profiles configuration")
-        return false
-    end
-
-    local active_profile = self:override("active_profile", common.active_profile) or DEFAULT_PROFILE
-    if type(active_profile) ~= "string" or active_profile == "" then
-        logger.warn("BT Plugin: Invalid active profile")
-        return false
+    local cfg = self.file_config
+    local checks = {
+        { "device_path",         isDevicePath(cfg.device_path) },
+        { "trigger_cooldown_ms", isNumberInRange(cfg.trigger_cooldown_ms, 0, 60000) },
+        { "axis_threshold",      isNumberInRange(cfg.axis_threshold, 0, 65535) },
+        { "key_map",             type(cfg.key_map) == "table" },
+        { "dpad_map",            type(cfg.dpad_map) == "table" },
+        { "analog_map",          type(cfg.analog_map) == "table" },
+        { "analog_center",       type(cfg.analog_center) == "table" },
+    }
+    for _, check in ipairs(checks) do
+        if not check[2] then
+            logger.warn("BT Plugin: Invalid or missing config field: " .. check[1])
+            return false
+        end
     end
 
-    local profile = profiles[active_profile]
-    if type(profile) ~= "table" or not isDevicePath(profile.device_path) then
-        logger.warn("BT Plugin: Invalid profile '" .. tostring(active_profile) .. "'")
-        return false
+    -- 每个映射到的轴都必须有中心值，否则 parseAnalogInput 会拿到 nil
+    for code in pairs(cfg.analog_map) do
+        if not isNumberInRange(cfg.analog_center[code], 0, 65535) then
+            logger.warn("BT Plugin: Missing analog_center for axis " .. tostring(code))
+            return false
+        end
     end
 
-    self.trigger_cooldown_ms = isNumberInRange(common.trigger_cooldown_ms, 0, 60000)
-        and common.trigger_cooldown_ms or self.trigger_cooldown_ms
-    self.active_profile = active_profile
-
-    -- 唯一校验点：输入热路径不再逐字段重查（docs §9）
-    self.config = {}
-    for k, v in pairs(profile) do
-        self.config[k] = v
-    end
-    self.config.invert_layout = self:override("invert_layout", common.invert_layout) == true
-    self.config.supports_dpad = profile.supports_dpad == true
-    -- 不能用 or：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
-    local analog_mode = self:override("analog_mode", {})[active_profile]
-    if analog_mode == nil then analog_mode = profile.use_analog_mode end
-    self.config.use_analog_mode = analog_mode == true
-    self.config.key_map = type(profile.key_map) == "table" and profile.key_map or {}
-    self.config.dpad_map = type(profile.dpad_map) == "table" and profile.dpad_map or {}
-    self.config.analog_map = type(profile.analog_map) == "table" and profile.analog_map or {}
-    self.config.analog_center = type(profile.analog_center) == "table" and profile.analog_center or {}
-    local threshold = profile.axis_threshold or profile.analog_threshold
-    self.config.analog_threshold = isNumberInRange(threshold, 0, 65535)
-        and threshold or AXIS_THRESHOLD_DEFAULT
+    self.trigger_cooldown_ms = cfg.trigger_cooldown_ms
+    self.config = {
+        device_path      = cfg.device_path,
+        key_map          = cfg.key_map,
+        dpad_map         = cfg.dpad_map,
+        analog_map       = cfg.analog_map,
+        analog_center    = cfg.analog_center,
+        analog_threshold = cfg.axis_threshold,
+        supports_dpad    = cfg.supports_dpad == true,
+        invert_layout    = self:override("invert_layout", cfg.invert_layout) == true,
+        -- 不能用 or：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
+        use_analog_mode  = self:override("use_analog_mode", cfg.use_analog_mode) == true,
+    }
     resetInputState()
-    local profile_name = type(profile.name) == "string" and profile.name or active_profile
-    logger.info("BT Plugin: Loaded profile '" .. profile_name .. "'")
+    logger.info("BT Plugin: Loaded config for " .. cfg.device_path)
     return true
 end
 
@@ -176,12 +163,6 @@ function BluetoothController:saveOverride(key, value)
     self.settings:saveSetting(key, value)
     self.settings:flush()
     logger.info("BT Plugin: Saved override " .. key)
-end
-
-function BluetoothController:saveAnalogMode(analog)
-    local modes = self:override("analog_mode", {})
-    modes[self.active_profile] = analog
-    self:saveOverride("analog_mode", modes)
 end
 
 function BluetoothController:registerInputHook()
@@ -566,7 +547,7 @@ function BluetoothController:addToMainMenu(menu_items)
             callback = function()
                 self.config.use_analog_mode = analog
                 resetInputState()
-                self:saveAnalogMode(analog)
+                self:saveOverride("use_analog_mode", analog)
             end,
         }
     end
@@ -601,46 +582,6 @@ function BluetoothController:addToMainMenu(menu_items)
                 table.insert(items, { text = dev.name .. _(tag) })
             end
             return items
-        end,
-    })
-
-    table.insert(sub_items, {
-        text = _("切换配置"),
-        keep_menu_open = true,
-        sub_item_table_func = function()
-            local profiles = {}
-
-            for profile_id, profile in pairs(self.file_config.profiles or {}) do
-                if type(profile) == "table" and isDevicePath(profile.device_path) then
-                    local name = type(profile.name) == "string" and profile.name or profile_id
-                    table.insert(profiles, {
-                        text = name,
-                        checked_func = function()
-                            return self.active_profile == profile_id
-                        end,
-                        callback = function()
-                            -- applyConfig 在校验通过前不改运行态，失败时只需还原覆盖值
-                            local previous = self.settings:readSetting("active_profile")
-                            self:saveOverride("active_profile", profile_id)
-                            if not self:applyConfig() then
-                                self:saveOverride("active_profile", previous)
-                                UIManager:show(InfoMessage:new{
-                                    text = _("配置切换失败"),
-                                    timeout = 2,
-                                })
-                                return
-                            end
-                            UIManager:show(InfoMessage:new{
-                                text = self:reloadDevice() and _("已切换到 ") .. name
-                                    or _("配置已切换，但未找到设备"),
-                                timeout = 2,
-                            })
-                        end,
-                    })
-                end
-            end
-
-            return profiles
         end,
     })
 

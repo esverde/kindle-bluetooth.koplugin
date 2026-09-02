@@ -11,34 +11,31 @@
 
 ## 配置文件
 
-配置文件为插件目录下的 `bluetooth.lua`。
-
-### 通用设置
+配置文件为插件目录下的 `bluetooth.lua`，**单手柄、扁平结构、无多 profile**。
 
 | 字段 | 说明 |
 | --- | --- |
-| `common.trigger_cooldown_ms` | 两次翻页触发之间的最小间隔，单位为毫秒。 |
-| `common.invert_layout` | 是否反转上一页/下一页方向。 |
-| `common.active_profile` | 当前使用的 profile ID。 |
-
-### 手柄 profile
-
-| 字段 | 说明 |
-| --- | --- |
-| `name` | 菜单中显示的手柄名称。 |
 | `device_path` | 手柄对应的 Linux 输入节点，例如 `/dev/input/event6`。 |
-| `supports_dpad` | 是否支持 D-Pad 模式。 |
+| `trigger_cooldown_ms` | 两次翻页触发之间的最小间隔，单位为毫秒（0~60000）。 |
+| `invert_layout` | 是否反转上一页/下一页方向。 |
+| `supports_dpad` | 是否允许在菜单里切换摇杆/方向键模式。 |
 | `use_analog_mode` | 是否使用模拟摇杆模式；关闭时使用 D-Pad 映射。 |
-| `axis_threshold` | 模拟轴死区阈值；旧配置中的 `analog_threshold` 也兼容。 |
-| `analog_center` | 模拟轴中心值，通常为每轴 `32768`。 |
+| `axis_threshold` | 模拟轴死区阈值（0~65535）。 |
+| `analog_center` | 模拟轴中心值，`analog_map` 里出现的每个轴码都必须有一项。 |
 | `key_map` | 按键码到翻页方向的映射；正数为下一页，负数为上一页。 |
 | `dpad_map` | D-Pad 轴码和值到翻页方向的映射；轴码 16/17，值为 -1/0/1。 |
 | `analog_map` | 模拟轴映射；轴码 0/1，分别表示 X/Y 轴。 |
 
-修改 profile 或设备路径后，应通过菜单重新加载设备。插件会先释放旧节点，再打开新节点。
+改完配置后用菜单「重新加载设备」生效，插件会先释放旧节点再打开新节点。
 
-配置加载会校验 profile 结构、输入节点格式和数值范围。非法配置不会替换当前运行配置；
-冷却时间和轴阈值越界时使用默认值。插件不会自动修改 `device_path`，设备节点需要手动维护。
+### 没有兜底：字段缺失或越界一律拒绝
+
+`applyConfig` 是唯一的校验点，上表每一项都**必填且必须合法**，任何一项不过关就
+整份配置被拒绝、打一行 `Invalid or missing config field: <字段名>`，运行中的旧配置
+保持不变。**插件不会静默替换成内置默认值** —— 这是刻意的：静默替换会让"我改了配置
+却没生效"变成无法排查的问题。
+
+校验通过之后，输入热路径直接索引这些字段，不再逐个判类型（docs §9）。
 
 **查真实节点号**：菜单「已连接设备」只显示名称与状态标签，节点号看 `crash.log`：
 
@@ -48,8 +45,8 @@ grep "Found input device" /mnt/us/koreader/crash.log
 ```
 
 **`bluetooth.lua` 是只读的**，插件永不改写它，注释和格式随你怎么写。
-菜单能改的三项（反转方向、摇杆模式、切换配置）写到另一个文件，见 §10 ——
-其中也包括「改了 `bluetooth.lua` 里那三项却不生效」这个后果。
+菜单能改的两项（反转方向、摇杆模式）写到另一个文件，见 §10 ——
+其中也包括「改了 `bluetooth.lua` 里那两项却不生效」这个后果。
 
 ## 输入设备边界
 
@@ -67,9 +64,9 @@ KOReader。这是 in-app 版的 evdev 独占（grab）：不消费的话，"上�
 
 ## 生命周期
 
-- 插件**每个 ReaderUI 实例化一次**（打开文档时日志会再打一遍 `Loaded profile`）。
+- 插件**每个 ReaderUI 实例化一次**（打开文档时日志会再打一遍 `Loaded config for`）。
   模块级的 `_current_active_controller` 指向当前实例，hook 只注册一次并委派给它。
-- 切换 profile、事件驱动重连、重新加载设备时，日志出现"关闭旧节点再打开新节点"是正常流程。
+- 事件驱动重连、重新加载设备时，日志出现"关闭旧节点再打开新节点"是正常流程。
 - 日志里的 `idx` 是 KOReader 内部输入设备数组下标，不是 `/dev/input/eventN`。
 - `[ko-input] Forked off fake event generator` 是 KOReader 的电源/屏幕/热插拔事件基础设施，
   不是手柄设备，不要动它。
@@ -406,40 +403,50 @@ if ok or err == C.ENODEV then
 
 | 文件 | 谁写 | 内容 |
 | --- | --- | --- |
-| `<插件目录>/bluetooth.lua` | **只有用户**，插件永不改写 | `device_path`、三张映射表、`axis_threshold`、`trigger_cooldown_ms`，以及三个可覆盖项的初始默认值 |
-| `<settings>/bluetooth_controller.lua` | 只有插件（`LuaSettings`） | `active_profile`、`invert_layout`、`analog_mode`（按 profile id 索引的表） |
+| `<插件目录>/bluetooth.lua` | **只有用户**，插件永不改写 | 全部配置字段（见开头那张表） |
+| `<settings>/bluetooth_controller.lua` | 只有插件（`LuaSettings`） | `invert_layout`、`use_analog_mode` 两个覆盖值 |
 
-取值顺序：**覆盖值 > `bluetooth.lua` > 内置默认**，由 `BluetoothController:override(key, fallback)`
+取值顺序只有两层：**覆盖值 > `bluetooth.lua`**，由 `override(key, from_file)`
 统一实现 —— 只在覆盖值为 `nil` 时回退，所以显式的 `false` 不会被误当作"未设置"。
 
 ### 后果：菜单改过的项，改 bluetooth.lua 不再生效
 
-`invert_layout`、`active_profile`、`use_analog_mode` 三项一旦在菜单里点过，
-就以覆盖文件为准。要改回由 `bluetooth.lua` 决定，删掉覆盖文件里对应的键，
-或直接删掉整个 `<settings>/bluetooth_controller.lua`。
+`invert_layout` 和 `use_analog_mode` 一旦在菜单里点过，就以覆盖文件为准。
+要交回文件控制，删掉覆盖文件里对应的键，或直接删掉整个
+`<settings>/bluetooth_controller.lua`。
 
 这是 KOReader 自己的模型（`defaults.lua` 给默认、`settings.reader.lua` 存覆盖）。
-
-### 拆分顺带删掉的代码
-
-`LuaSettings:flush()`（`luasettings.lua:270`）本身就是
-`backup()` + `writeToFile(dump(data, nil, true), file, true, true, dir_updated)`，
-和插件此前手写的那套一字不差。所以：
-
-- `writeConfigAtomically`（14 行）→ 删
-- `saveFullConfig`（13 行）→ 删
-- `_config_loaded` 闸门 → 删（`bluetooth.lua` 根本不再被写，无从覆盖）
-- `setCommonSetting` / `setActiveProfileSetting`（16 行）→ 合并为 `saveOverride` + `saveAnalogMode`（11 行）
 
 ### 陷阱：读覆盖值不能用 `or`
 
 ```lua
 -- 错：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
-local mode = overrides[profile_id] or profile.use_analog_mode
--- 对：
-local mode = overrides[profile_id]
-if mode == nil then mode = profile.use_analog_mode end
+local mode = self:override("use_analog_mode", cfg.use_analog_mode) or cfg.use_analog_mode
+-- 对：override 内部只判 nil
+function BluetoothController:override(key, from_file)
+    local value = self.settings:readSetting(key)
+    if value == nil then return from_file end
+    return value
+end
 ```
+
+症状是"选了方向键，重启后变回模拟摇杆"，只有重启才暴露 —— 所以验证表里
+专门列了「重启后仍是方向键」这一项。
+
+### 这次拆分与单手柄化删掉的代码
+
+`LuaSettings:flush()`（`luasettings.lua:270`）本身就是
+`backup()` + `writeToFile(dump(data, nil, true), file, true, true, dir_updated)`，
+和插件此前手写的那套一字不差。所以：
+
+- `writeConfigAtomically`、`saveFullConfig`、`_config_loaded` 闸门 → 删
+- `setCommonSetting` / `setActiveProfileSetting` → 合并为一个 `saveOverride`
+- `profiles` 嵌套、`active_profile`、`saveAnalogMode`、「切换配置」菜单项 → 删
+- `AXIS_CENTER_DEFAULT`、`AXIS_THRESHOLD_DEFAULT`、`DEFAULT_PROFILE`
+  与类表上的 `trigger_cooldown_ms` → 删，改为加载时校验
+
+`DEFAULT_PROFILE` 尤其该删：它硬编码了一个具体手柄名，把 profile 改名而忘了同步
+`active_profile` 就会导致插件拒绝启动 —— 那是"猜一个名字"，不是兜底。
 
 ---
 
@@ -471,7 +478,7 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 
 | 步骤 | 操作 | 期待日志 |
 | --- | --- | --- |
-| 加载 | 启动 KOReader | `Loaded profile '<名字>'` |
+| 加载 | 启动 KOReader | `Loaded config for /dev/input/eventN` |
 | 打开 | 同上（`init` 里就会开） | `Opened device /dev/input/eventN` |
 | 扫描 | 菜单 → 工具 → 蓝牙翻页器 → 已连接设备 | `Found input device: … (opened=true)`，且**只列手柄** |
 | 热插拔 | 关手柄，等 3 秒，再开 | `Input device removed:` → `Input device inserted:` → `Opened device` |
@@ -485,10 +492,9 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 | --- | --- | --- |
 | 蓝牙开关 | 成功时无日志；失败才有 `Failed to change Bluetooth state` | 提示「蓝牙已开启 / 已关闭」 |
 | 已连接设备 | `Found input device: …` | 只列手柄，不含手写笔/触屏 |
-| 切换配置 | `Saved override active_profile` → `Loaded profile '…'` | — |
 | 反转方向 | `Saved override invert_layout` | **重启后仍然反转** |
-| 摇杆模式 → 方向键 | `Saved override analog_mode` | **重启后仍是方向键** |
-| 重新加载设备 | `Loaded profile` → `Closing device` → `Opened device` | — |
+| 摇杆模式 → 方向键 | `Saved override use_analog_mode` | **重启后仍是方向键** |
+| 重新加载设备 | `Loaded config for` → `Closing device` → `Opened device` | — |
 | 清理蓝牙垃圾 | `Cleaned up bluetooth dump files` | — |
 
 「另外确认」里那两个**重启后**是配置拆分（§10）的关键验证点：覆盖值存在
