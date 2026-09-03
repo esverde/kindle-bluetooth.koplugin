@@ -725,7 +725,13 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
 - `Loaded config for /dev/input/event3` → `Opened device /dev/input/event3`
 - 「已连接设备」列出手柄、「清理蓝牙垃圾」正常
 - **摇杆翻页正常**（`GotoViewRel` 无日志，靠肉眼确认）
+- **四个面键与两个肩键（310/312）翻页正常**
 - **重启后配置正常加载**
+- **守护进程菜单开关**（§12）：起停各一次，`Input device removed` /
+  `inserted` → `Opened device` 全自动衔接
+- **`onEvdevInputRemove` 在「节点被拔掉」方向也成立**：§2 里那批日志是手柄
+  自己掉线触发的，这次是**提供节点的进程被杀**触发的 —— 同一个 handler、
+  不同触发源，都能正确释放 fd
 - khp 迁移彻底：`config.ini` 两条路径指向 `khp/`，`devices.conf` 与
   `cache/{pairing_keys.json,04_33_85_2C_BF_5B.json}` 均在 `khp/` 内
 
@@ -781,7 +787,26 @@ util.shell_escape({ self.path .. "/khp/dist/main.bin" })
 ### 起停都不是同步的
 
 `setsid … --daemon … &` 和 `pkill` 之后 shell 立刻返回，`os.execute` 的退出码
-**没有意义**。实测守护进程约 3s 才就绪（`+2.919s` 那行），所以：
+**没有意义**。实测时序（设备日志）：
+
+```
+23:12:37  khp daemon stop requested
+23:12:37  Input device removed: /dev/input/event3      ← 同一秒
+23:12:37  Closing device /dev/input/event3
+          [ko-input] Closed input device with fd: 12 (matched by fd)
+23:12:49  khp daemon start requested
+23:12:54  Input device inserted: /dev/input/event3      ← +5s
+23:12:54  Opened device /dev/input/event3               ← settle 0.5s 内
+```
+
+- **停是同步的**：`pkill` 的那一秒 uevent 就到，fd 立刻释放。
+- **起要约 5s**：守护进程自身约 3s 就绪，之后还要重连 BLE、建 uhid 节点。
+  所以 `DAEMON_START_DELAY = 6` 不是拍的 —— 它刚好落在节点出现之后，
+  那句「守护进程已启动」才会在设备真的回来之后弹出。改这个常量前先看这段时序。
+- 重连**全自动**，不需要手动「重新加载设备」：`onEvdevInputInsert` 接住
+  uevent，等 `RECONNECT_SETTLE_DELAY` 后 `Opened device`。
+
+所以：
 
 - 点击后先弹「正在启动/停止…」
 - `UIManager:scheduleIn(6, …)` 再查一次并报结果 —— **不用阻塞 sleep**。
@@ -844,8 +869,8 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 
 | 菜单项 | 期待日志 | 另外确认 |
 | --- | --- | --- |
-| 蓝牙守护进程 → 开 | `khp daemon start requested` | 约 6s 后提示「已启动」；`ps aux \| grep main.bin` 有进程 |
-| 蓝牙守护进程 → 关 | `khp daemon stop requested` | 提示「已停止」；进程真的没了；**手柄节点随之消失，插件应打 `Input device removed`** |
+| 蓝牙守护进程 → 开 | `khp daemon start requested` → 约 5s 后 `Input device inserted` → `Opened device` | 提示「已启动」；此时会连着弹一条「手柄已重新连接」，两条 toast 各占一次 e-ink 刷新，属正常 |
+| 蓝牙守护进程 → 关 | `khp daemon stop requested` → 同一秒 `Input device removed` → `Closing device` | 提示「已停止」；`ko-input` 打出 `Closed input device with fd: N` |
 | 已连接设备 | `Found input device: …` | 只列手柄，不含触屏/frame tap |
 | 反转方向 | `Saved override invert_layout` | **重启后仍然反转** |
 | 摇杆模式 → 方向键 | `Saved override use_analog_mode` | **重启后仍是方向键** |
