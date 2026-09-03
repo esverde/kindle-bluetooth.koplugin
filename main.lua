@@ -56,17 +56,12 @@ end
 local BluetoothController = WidgetContainer:extend {
     name = "BluetoothController",
     is_doc_only = false,
-
-    config = {},
-    settings = nil,     -- 菜单可改的两个覆盖值，见 docs §10
-
-    opened_path = nil,
-    opened_fd = nil,
 }
 
 function BluetoothController:init()
     if not Device:isKindle() then return end
     self.config = {}
+    -- self.settings 存菜单可改的覆盖值，见 docs §10
     self.settings = LuaSettings:open(
         DataStorage:getSettingsDir() .. "/bluetooth_controller.lua")
     -- 匹配完整路径而非 'ld-linux-armhf.'，算一次即可（docs §12）
@@ -270,10 +265,6 @@ function BluetoothController:closeDevice(path)
     return true
 end
 
-function BluetoothController:reloadDevice()
-    return self:openDevice(true)
-end
-
 function BluetoothController:isDeviceOpened(path)
     return Device.input.opened_devices[path] ~= nil
 end
@@ -328,9 +319,17 @@ function BluetoothController:stopDaemon()
     logger.info("BT Plugin: khp daemon stop requested")
 end
 
+-- 起停不同步，故延时回查（docs §12）
+function BluetoothController:_daemonCheck()
+    UIManager:show(InfoMessage:new{
+        text = self:isDaemonRunning() and _("守护进程已启动") or _("守护进程已停止"),
+        timeout = 2,
+    })
+end
+
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
-    if self:reloadDevice() then
+    if self:openDevice(true) then
         UIManager:show(InfoMessage:new{ text = _("手柄已重新连接"), timeout = 2 })
     end
 end
@@ -465,10 +464,10 @@ function BluetoothController:cleanupBluetoothDumps()
     return true
 end
 
--- [是否当前配置][是否已打开]；存原文，_() 在使用处调用
+-- [是否当前配置][是否已打开]
 local DEVICE_TAGS = {
-    [true]  = { [true] = " [当前]",   [false] = " [已配置]" },
-    [false] = { [true] = " [已连接]", [false] = " [可用]" },
+    [true]  = { [true] = _(" [当前]"),   [false] = _(" [已配置]") },
+    [false] = { [true] = _(" [已连接]"), [false] = _(" [可用]") },
 }
 
 function BluetoothController:addToMainMenu(menu_items)
@@ -491,17 +490,9 @@ function BluetoothController:addToMainMenu(menu_items)
                 timeout = 2,
             })
 
-            -- 起停不同步，故延时回查；存成字段是为了能 unschedule（docs §12）
-            UIManager:unschedule(self._daemon_check)
-            self._daemon_check = function()
-                UIManager:show(InfoMessage:new{
-                    text = self:isDaemonRunning() and _("守护进程已启动")
-                        or _("守护进程已停止"),
-                    timeout = 2,
-                })
-            end
-            -- 不主动 reloadDevice，那条路由 onEvdevInputInsert 兜住（docs §12）
-            UIManager:scheduleIn(starting and DAEMON_START_DELAY or 1, self._daemon_check)
+            -- 不主动重开设备，那条路由 onEvdevInputInsert 兜住（docs §12）
+            UIManager:unschedule(self._daemonCheck)
+            UIManager:scheduleIn(starting and DAEMON_START_DELAY or 1, self._daemonCheck, self)
         end,
     })
 
@@ -520,7 +511,7 @@ function BluetoothController:addToMainMenu(menu_items)
             local items = {}
             for _i, dev in ipairs(devices) do
                 local tag = DEVICE_TAGS[dev.path == self.config.device_path][dev.opened]
-                table.insert(items, { text = dev.name .. _(tag) })
+                table.insert(items, { text = dev.name .. tag })
             end
             return items
         end,
@@ -540,7 +531,7 @@ function BluetoothController:addToMainMenu(menu_items)
         callback = function()
             UIManager:show(InfoMessage:new{
                 text = not self:loadSettings() and _("配置加载失败")
-                    or self:reloadDevice() and _("设备已加载")
+                    or self:openDevice(true) and _("设备已加载")
                     or _("加载失败"),
                 timeout = 2,
             })
@@ -567,7 +558,7 @@ end
 
 function BluetoothController:onExit()
     UIManager:unschedule(self._reconnect)
-    UIManager:unschedule(self._daemon_check)
+    UIManager:unschedule(self._daemonCheck)
     if _current_active_controller == self then
         self:closeDevice()
         _current_active_controller = nil
