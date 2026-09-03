@@ -90,13 +90,6 @@ function BluetoothController:loadSettings()
     return self:applyConfig(file_config)
 end
 
--- 覆盖值 > bluetooth.lua，无第三层兜底。判 nil 而非 `or` 的理由见 docs §10
-function BluetoothController:override(key, from_file)
-    local value = self.settings:readSetting(key)
-    if value == nil then return from_file end
-    return value
-end
-
 -- 唯一的校验点：全部字段必填，一项不过关就整份拒绝（docs §10、§9）
 function BluetoothController:applyConfig(cfg)
     local checks = {
@@ -127,7 +120,10 @@ function BluetoothController:applyConfig(cfg)
     for k, v in pairs(cfg) do
         self.config[k] = v
     end
-    self.config.invert_layout = self:override("invert_layout", cfg.invert_layout) == true
+    -- 覆盖值 > bluetooth.lua，无第三层兜底；判 nil 而非 `or` 的理由见 docs §10
+    local saved = self.settings:readSetting("invert_layout")
+    if saved == nil then saved = cfg.invert_layout end
+    self.config.invert_layout = saved == true
     resetInputState()
     logger.info("BT Plugin: Loaded config for " .. cfg.device_path)
     return true
@@ -197,7 +193,7 @@ local function isControllerDevice(path)
     local device = library.fbink_input_check(path, masks.match, masks.exclude, masks.settings)
     if device == nil then return false end
 
-    local matched = device.matched == true
+    local matched = device.matched
     C.free(device)
     return matched
 end
@@ -214,11 +210,10 @@ function BluetoothController:openDevice(is_reload)
         return false
     end
 
-    local was_open = self:isDeviceOpened(path)
     local usable = isControllerDevice(path)
 
     -- 关闭顺序的权衡见 docs §9
-    if was_open and (is_reload or not usable)
+    if self:isDeviceOpened(path) and (is_reload or not usable)
         and not self:closeDevice(path) then
         return false
     end
@@ -368,9 +363,7 @@ function BluetoothController:handleInputEvent(ev)
 
     self:pokeActivity()
 
-    if self.config.invert_layout then
-        direction = -direction
-    end
+    if self.config.invert_layout then direction = -direction end
 
     UIManager:sendEvent(Event:new("GotoViewRel", direction))
     ev.type = -1
@@ -386,9 +379,7 @@ function BluetoothController:parseInputDirection(ev)
     end
 
     -- 本手柄只有摇杆，没有十字键，所以 EV_ABS 只有一条路（docs §11）
-    if ev.type == C.EV_ABS then
-        return self:parseAnalogInput(ev)
-    end
+    if ev.type == C.EV_ABS then return self:parseAnalogInput(ev) end
 
     return nil
 end
@@ -404,19 +395,12 @@ function BluetoothController:parseAnalogInput(ev)
 
     _shared_axis_values[ev.code] = deviation
 
+    -- 全部映射轴都回中才解锁，否则一次推杆会连翻（docs §4）
     if deviation <= threshold then
-        if _shared_triggered then
-            local all_centered = true
-            for axis_code, axis_deviation in pairs(_shared_axis_values) do
-                if analog_map[axis_code] and axis_deviation > threshold then
-                    all_centered = false
-                    break
-                end
-            end
-            if all_centered then
-                _shared_triggered = false
-            end
+        for axis_code, axis_deviation in pairs(_shared_axis_values) do
+            if analog_map[axis_code] and axis_deviation > threshold then return nil end
         end
+        _shared_triggered = false
         return nil
     end
 
