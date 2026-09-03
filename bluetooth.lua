@@ -13,7 +13,12 @@ return {
 
     invert_layout = false,    -- [可覆盖] 反转方向
     use_analog_mode = true,   -- [可覆盖] 摇杆模式
-    supports_dpad = true,     -- ABS=307bf 含 bit 16/17（HAT0X/Y），docs §11
+
+    -- 必须为 false。ABS=307bf 里确实有 bit 16/17（HAT0X/Y），但那只是 HID
+    -- report descriptor 的能力声明 —— 这个手柄物理上没有十字键，实测只按
+    -- 方向键时 event3 一个 type=3 code=16/17 都不发。留成 true 的后果是菜单
+    -- 能切到一个收不到事件的模式，切完就翻不了页，且覆盖值会持久化。
+    supports_dpad = false,
 
     -- 8 位有符号，中心 0，实测极值 ±127。95 ≈ 3/4 行程，是这份配置里
     -- 唯一值得按手感调的数：调低更灵敏，也更容易误翻。
@@ -28,10 +33,10 @@ return {
         [305] = 1,  [308] = 1,  [311] = 1,    -- B / Y / R1 下一页
     },
 
-    dpad_map = {
-        [17] = { [-1] = 1, [1] = -1 },        -- HAT0Y 上=上一页，下=下一页
-        [16] = { [-1] = -1, [1] = 1 }         -- HAT0X 左=上一页，右=下一页
-    },
+    -- 本手柄无十字键，故为空表。applyConfig 仍要求这个字段存在且是 table。
+    -- 不删 main.lua 里的 dpad 代码路径：那是与主分支共用的，删了每次
+    -- git merge main 都要处理冲突，而它在 supports_dpad=false 下不可达。
+    dpad_map = {},
 
     analog_map = {
         [1] = { low_dir = 1, high_dir = -1 }, -- ABS_Y
