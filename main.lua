@@ -18,6 +18,8 @@ local C = ffi.C
 
 local POWER_RESET_INTERVAL = 60
 local RECONNECT_SETTLE_DELAY = 0.5  -- docs §9
+local DAEMON_CACHE_INTERVAL = 2     -- 秒，菜单重绘不必每次 fork 一个 pgrep
+local DAEMON_START_DELAY = 6        -- 秒，实测约 3s 起完，留一倍余量
 
 local DUMP_TARGETS = {
     { directory = "/mnt/us", patterns = {
@@ -305,6 +307,46 @@ function BluetoothController:scanJoystickDevices()
     return devices
 end
 
+-- khp 守护进程：只需要「在 / 不在」两态，用信号起停就够了（docs §12）
+function BluetoothController:khpPath(name)
+    return self.path .. "/khp/" .. name
+end
+
+-- 匹配完整路径，不用 khp 自己脚本里的 'ld-linux-armhf.' —— 那个模式会命中
+-- 任何用同名加载器起的进程
+function BluetoothController:daemonPattern()
+    return util.shell_escape({ self:khpPath("dist/main.bin") })
+end
+
+function BluetoothController:isDaemonRunning()
+    if self._daemon_time and time.since(self._daemon_time) < time.s(DAEMON_CACHE_INTERVAL) then
+        return self._daemon_cached
+    end
+    self._daemon_cached = os.execute("pgrep -f " .. self:daemonPattern() .. " >/dev/null 2>&1") == 0
+    self._daemon_time = time.now()
+    return self._daemon_cached
+end
+
+function BluetoothController:startDaemon()
+    local binary = self:khpPath("kindle-hid-passthrough")
+    if lfs.attributes(binary, "mode") ~= "file" then
+        logger.warn("BT Plugin: khp binary missing at " .. binary)
+        return false
+    end
+    -- setsid 让它脱离 KOReader 的进程组，否则 KOReader 退出会把它一起带走
+    os.execute(string.format("setsid %s --daemon >/dev/null 2>&1 </dev/null &",
+        util.shell_escape({ binary })))
+    logger.info("BT Plugin: khp daemon start requested")
+    return true
+end
+
+function BluetoothController:stopDaemon()
+    -- SIGTERM，与 khp 自带 daemon.sh 的 stop() 一致
+    os.execute("pkill -f " .. self:daemonPattern())
+    logger.info("BT Plugin: khp daemon stop requested")
+    return true
+end
+
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
     if self:reloadDevice() then
@@ -475,6 +517,42 @@ function BluetoothController:addToMainMenu(menu_items)
     local sub_items = {}
 
     table.insert(sub_items, {
+        text = _("蓝牙守护进程"),
+        keep_menu_open = true,
+        checked_func = function() return self:isDaemonRunning() end,
+        callback = function()
+            local starting = not self:isDaemonRunning()
+            if starting and not self:startDaemon() then
+                UIManager:show(InfoMessage:new{
+                    text = _("找不到守护进程，见 docs §12"), timeout = 3 })
+                return
+            end
+            if not starting then self:stopDaemon() end
+            self._daemon_time = nil
+            UIManager:show(InfoMessage:new{
+                text = starting and _("正在启动守护进程…") or _("正在停止守护进程…"),
+                timeout = 2,
+            })
+
+            -- 起停都不同步：`&` 与 pkill 之后 shell 立刻返回，实测约 3s 才就绪。
+            -- 存成字段是为了能在 onExit 里 unschedule —— 匿名闭包会持有 self，
+            -- 也就连带持有 ReaderUI（这类泄漏在本仓库出现过一次）。
+            UIManager:unschedule(self._daemon_check)
+            self._daemon_check = function()
+                self._daemon_time = nil
+                UIManager:show(InfoMessage:new{
+                    text = self:isDaemonRunning() and _("守护进程已启动")
+                        or _("守护进程已停止"),
+                    timeout = 2,
+                })
+            end
+            -- 不主动 reloadDevice：节点是手柄连上时才出现的，可能晚于这个延时，
+            -- 而那条路已经由 onEvdevInputInsert 兜住（docs §2，已实测）
+            UIManager:scheduleIn(starting and DAEMON_START_DELAY or 1, self._daemon_check)
+        end,
+    })
+
+    table.insert(sub_items, {
         text = _("已连接设备"),
         keep_menu_open = true,
         sub_item_table_func = function()
@@ -547,6 +625,7 @@ end
 
 function BluetoothController:onExit()
     UIManager:unschedule(self._reconnect)
+    UIManager:unschedule(self._daemon_check)
     if _current_active_controller == self then
         self:closeDevice()
         _current_active_controller = nil

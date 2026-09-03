@@ -744,6 +744,64 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
   手柄就稳定落在 event3。多接一个就会漂移。掉线重连本身由
   `onEvdevInputInsert` 兜住（§2），但**换了节点号要改配置**。
 
+## §12 守护进程开关：为什么用信号而不是 HTTP API
+
+khp 的守护进程在 `127.0.0.1:8321` 暴露一个 HTTP API（`/status` `/start` `/stop`），
+它自带的 KOReader 插件就是走这条路的。**本插件不用它，用 `pgrep` + `pkill`。**
+
+### 理由
+
+**上游自己的停止方式就是信号。** `scripts/hid-passthrough-daemon.sh` 的 `stop()`：
+
+```sh
+PID=$(pgrep -f "$LD_PROCESS")
+kill -TERM "$PID"
+```
+
+**那个「三态」是用 API 停的产物，不是守护进程的性质。** khp 插件要区分
+`off`（API 不可达）/ `api_only`（API 活着但 HID 层停了）/ `on`，是因为它的 `/stop`
+**故意只停 HID 层、留着 API server** 好让下次启动快。我们用信号停整个进程，
+就只剩「进程在 / 不在」两态，状态机整个不需要存在。
+
+**它需要 API 是因为它做的事多得多** —— 配对、扫描、设备列表、按键映射，那些都得
+跟守护进程对话。本插件只要开关，进程存活性 `pgrep` 就够，
+`socket.http` + 超时 + JSON 解析 + 轮询状态机全是白背的复杂度。
+
+### 一处比上游更准
+
+khp 脚本用 `pgrep -f "ld-linux-armhf."`，这个模式**太宽** —— 会命中任何用同名
+动态加载器起的进程。我们知道自己装在哪，所以匹配完整路径：
+
+```lua
+util.shell_escape({ self.path .. "/khp/dist/main.bin" })
+```
+
+（`self.path` 由 PluginLoader 注入，见 §7。）
+
+### 起停都不是同步的
+
+`setsid … --daemon … &` 和 `pkill` 之后 shell 立刻返回，`os.execute` 的退出码
+**没有意义**。实测守护进程约 3s 才就绪（`+2.919s` 那行），所以：
+
+- 点击后先弹「正在启动/停止…」
+- `UIManager:scheduleIn(6, …)` 再查一次并报结果 —— **不用阻塞 sleep**。
+  khp 插件那边是 `ffiutil.sleep(1)` 循环 + `START_TIMEOUT = 15`，会**卡住
+  KOReader UI 线程最多 15 秒**，e-ink 上就是整机假死。
+- 延时回调**只弹 InfoMessage，不碰菜单控件** —— 用户可能已经关掉菜单，
+  在死控件上 `updateItems` 是自找麻烦。状态由 `checked_func` 下次重绘时自然刷新。
+- 回调**存成 `self._daemon_check` 字段**而不是匿名闭包，这样 `onExit` 能
+  `unschedule` 掉。匿名闭包会持有 `self`，也就连带持有 ReaderUI ——
+  这类泄漏在本仓库出现过一次。
+  （`UIManager:unschedule(nil)` 是安全空操作：每个已排程任务的 `action` 都非 nil，
+  `uimanager.lua:440` 的比较不会命中。）
+
+**不主动 `reloadDevice()`。** 节点是手柄连上时才出现的，可能晚于那 6 秒；
+而那条路已经由 `onEvdevInputInsert` 兜住（§2，已实测）。
+
+`checked_func` 会在每次菜单重绘时被调用，所以 `isDaemonRunning` 带 2 秒缓存
+（`DAEMON_CACHE_INTERVAL`），否则每次重绘都 fork 一个 `pgrep` —— 与主分支给
+蓝牙状态加缓存是同一个理由。
+
 ---
 
 # 验证方法
@@ -786,6 +844,8 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 
 | 菜单项 | 期待日志 | 另外确认 |
 | --- | --- | --- |
+| 蓝牙守护进程 → 开 | `khp daemon start requested` | 约 6s 后提示「已启动」；`ps aux \| grep main.bin` 有进程 |
+| 蓝牙守护进程 → 关 | `khp daemon stop requested` | 提示「已停止」；进程真的没了；**手柄节点随之消失，插件应打 `Input device removed`** |
 | 已连接设备 | `Found input device: …` | 只列手柄，不含触屏/frame tap |
 | 反转方向 | `Saved override invert_layout` | **重启后仍然反转** |
 | 摇杆模式 → 方向键 | `Saved override use_analog_mode` | **重启后仍是方向键** |
