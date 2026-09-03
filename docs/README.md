@@ -727,6 +727,8 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
 - **摇杆翻页正常**（`GotoViewRel` 无日志，靠肉眼确认）
 - **四个面键与两个肩键（310/312）翻页正常**
 - **重启后配置正常加载**
+- **「反转方向」重启后仍然反转**（`Saved override invert_layout`）—— §10 的
+  关键验证点，历史上正是这里踩过「读覆盖值用 `or` 会把 `false` 吃掉」的坑
 - **守护进程菜单开关**（§12）：起停各一次，`Input device removed` /
   `inserted` → `Opened device` 全自动衔接
 - **`onEvdevInputRemove` 在「节点被拔掉」方向也成立**：§2 里那批日志是手柄
@@ -735,20 +737,26 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
 - khp 迁移彻底：`config.ini` 两条路径指向 `khp/`，`devices.conf` 与
   `cache/{pairing_keys.json,04_33_85_2C_BF_5B.json}` 均在 `khp/` 内
 
-### 尚未验证
+**功能验证到此完整**，验证方法一节的菜单表每一项都点过。
 
-- **菜单两个覆盖项的重启持久化。** 「反转方向」应打 `Saved override
-  invert_layout` 且重启后仍反转（§10 的关键验证点，历史上出过 `or` 吃掉
-  `false` 的 bug）。「摇杆模式」在本手柄上不可用（`supports_dpad = false`
-  使菜单项禁用），所以 `use_analog_mode` 那条覆盖值在本分支测不到 ——
-  若之前误存过 `false`，得手删 `<settings>/bluetooth_controller.lua` 里那一项，
-  否则会停在收不到事件的方向键模式且无法从菜单切回。
-- **`event3` 这个节点号能扛多少次重连。** 已实测：重新配对+重启守护进程后
-  sysfs 变成 `uhid/0005:0000:0000.0002/input/input4` —— **`inputN` 单调递增
-  （3 → 4），但 evdev handler 仍是 `event3`**，因为 `eventN` 会回收复用。
-  所以只要 3 个内建节点（event0/1/2）不变、且不同时接第二个 HID 设备，
-  手柄就稳定落在 event3。多接一个就会漂移。掉线重连本身由
-  `onEvdevInputInsert` 兜住（§2），但**换了节点号要改配置**。
+### 两个遗留注意事项（不是待测项）
+
+**`use_analog_mode` 的覆盖值在本分支测不到，但可能把人锁死。**
+`supports_dpad = false` 让「摇杆模式」菜单项禁用，所以这条覆盖值正常情况下
+永远写不进去。但**若在 `supports_dpad` 还是 `true` 的那几个版本里误切过
+「方向键」**，覆盖值 `false` 已经存进 `<settings>/bluetooth_controller.lua`，
+而现在菜单是灰的、切不回来 —— 症状是完全不翻页。解法是手删那一项：
+
+```sh
+grep use_analog_mode /mnt/us/koreader/settings/bluetooth_controller.lua
+```
+
+**`event3` 这个节点号会漂移。** 已实测：重新配对+重启守护进程后 sysfs 变成
+`uhid/0005:0000:0000.0002/input/input4` —— **`inputN` 单调递增（3 → 4），
+但 evdev handler 仍是 `event3`**，因为 `eventN` 会回收复用。所以只要 3 个内建
+节点（event0/1/2）不变、且不同时接第二个 HID 设备，手柄就稳定落在 event3。
+多接一个就会漂移。掉线重连本身由 `onEvdevInputInsert` 兜住（§2），
+但**换了节点号要改 `bluetooth.lua`**（节点号看 §「查真实节点号」）。
 
 ## §12 守护进程开关：为什么用信号而不是 HTTP API
 
