@@ -568,7 +568,7 @@ characteristic，**没有任何翻页逻辑**；`turnkey` 的输入设备只实�
 
 | 丢弃 | 大小 | 理由 |
 | --- | --- | --- |
-| `dist/kindle_hid_passthrough/modules/` | 1.3M | 12 个 `uhid-*.ko`，是给 8–10 代**内核没编 `CONFIG_UHID`** 的机器补的。PW6 内核 5.15.41 原生支持（`--diagnostics` 里 `/dev/uhid: True`、`/sys/bus/hid: True`）。守护进程日志自己也写了：*"only needed to inject key events for external tools like kindle-button-mapper"* |
+| `dist/kindle_hid_passthrough/modules/` | 1.3M | 三类预编译模块，两个用途都跟本分支无关：8 个 `uhid-*.ko`（内核 3.0.35 / 3.10.53 / 4.1.15，板名 duet / heisenberg / rex / zelda）是给 8–10 代**内核没编 `CONFIG_UHID`** 的机器补的 —— PW6 内核 5.15.41 原生支持（`--diagnostics` 里 `/dev/uhid: True`、`/sys/bus/hid: True`）；2 个 `uinput-*.ko` 加 1 个 `hid-*.ko` 是给 button-mapper 之类外部工具注入按键用的 —— 我们不用 |
 | `button-mapper/` | 878K | 上游 boot loop 成因之一，见下 |
 | `koreader-plugin/` | 201K | 与本插件功能重叠（也做按键→动作映射），且它的 KOReader 动作需要开 HTTP Inspector |
 | `illusion/` | 88K | WAF app 相关 |
@@ -709,6 +709,27 @@ Serving devices (Classic: 0, BLE: 1)     ← 只剩这两行，BLE 不受影响
 注意 Classic 设备数是 0 时它**照样**开 page scan —— 也就是说这扇门跟你有没有
 配 Classic 设备无关，只跟这个开关有关。
 
+### 两条正常出现的 WARNING
+
+**`no bundled uinput.ko for this Kindle; HID passthrough is unaffected`**
+（连带 4 行 `model` / `codename` / `kernel` / `searched` 的诊断信息）——
+它找的是 **uinput**，不是 uhid，用途是给 button-mapper 之类外部工具注入按键，
+日志自己也写了 *"only needed to inject key events for external tools"* 和
+*"HID passthrough is unaffected"*。我们剪裁时删掉了 `modules/`，且本来也不用
+button-mapper，所以这条**必然出现且可以忽略**。
+
+**`bumble.gatt_client: !!! received notification with no subscriber`** ——
+手柄在 khp 订阅之前就发了一份 input report。看时间戳能确认这是个启动竞态：
+
+```
+30,592  [BLE] Restoring bonding...
+30,635  !!! received notification with no subscriber   ← 此时还没订阅
+31,197  [BLE] Subscribed to report 3
+```
+
+约 0.6 秒的窗口，丢掉的是这期间的按键。**如果守护进程启动的那一两秒里你正好
+按着键，那次按下会丢** —— 除此之外无影响。
+
 ### 不要装的三样（即使用官方安装器）
 
 | 跳过 | 理由 |
@@ -838,6 +859,12 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
   不同触发源，都能正确释放 fd
 - khp 迁移彻底：`config.ini` 两条路径指向 `khp/`，`devices.conf` 与
   `cache/{pairing_keys.json,04_33_85_2C_BF_5B.json}` 均在 `khp/` 内
+- **精简后的 `config.ini` 与剪裁后的 `khp/` 一次跑通**：`searched:` 三条路径
+  全在 `khp/` 下（base path 正确）、`Device: … (ble)`（`devices.conf` 生效、
+  删 `[protocol]` 无害）、`[Media]` 与 `Page Scan` 缺席（`media_remote=false` 生效）、
+  完整 BLE HID 链路 `Bonding restored` → `Found HID service` →
+  `Created UHID device (rd_size=154)` → `Subscribed to report 3` →
+  `receiving HID reports` → `battery: 100%`
 
 **功能验证到此完整**，验证方法一节的菜单表每一项都点过。
 
