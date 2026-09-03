@@ -617,7 +617,62 @@ API 端口 8321 被占。先 `pkill -f ld-linux-armhf`。
 
 ### config.ini 各项
 
-`[paths]` 两条迁移时必须改（见上）。其余：
+**每个键都有默认值，所以整份 `config.ini` 都是可选的。** `Config._load` 用的是
+带默认值的三参包装 `_get(section, key, default)` / `_getint`：
+
+```
+_get "paths" "cache_dir"      → 默认 <base>/cache
+_get "paths" "devices_config" → 默认 <base>/devices.conf
+_get "logging" "log_file"     → 默认 /var/log/hid_passthrough.log
+```
+
+（这是从 stripped 二进制的字符串邻接**推**出来的，很强但不是证明。）
+
+由于 base path 已经是 `khp/` 目录，`[paths]` 算出来的默认值和手写的一模一样 ——
+**但仍然建议显式写出来**：迁移时最容易出错的就是这两条（本仓库为此排查了
+一整轮，症状是 `Using device from /mnt/us/kindle_hid_passthrough/devices.conf`）。
+显式写着，下次一眼能看到要改什么；删了就变成隐式行为，得重新推一遍 base path
+的解析顺序。两行的保留成本是零。
+
+**可以整节删掉的**（都是惰性的）：
+
+| 删掉 | 为什么惰性 |
+| --- | --- |
+| `[transport]` | 整节本来全是注释，按机型自动探测 |
+| `[device]` | `name` 本来是注释；`address` 是占位符，只在 `devices.conf` 缺失时作单设备兜底 |
+| `[protocol]` | 同上，只是兜底默认。实际协议按设备记在 `devices.conf` |
+
+**唯一必须显式写的是 `[media_remote] enabled = false`** —— 出厂 `config.ini` 里是
+`true`，靠省略拿不到 `false`。
+
+精简到最小可用：
+
+```ini
+[paths]
+cache_dir = <khp>/cache
+devices_config = <khp>/devices.conf
+
+[connection]
+reconnect_delay = 5
+hci_reset_timeout = 10
+connect_timeout = 30
+transport_timeout = 30
+
+[media_remote]
+enabled = false
+
+[logging]
+log_file = <khp>/hid_passthrough.log
+```
+
+`[connection]` 那四个值与 `--diagnostics` 的回显一致，留着无成本；删掉则要赌
+代码里的默认值与它们相同，而那个从二进制里读不出来。
+
+> `log_file` 挪到 `/mnt/us` 之后就不再是 tmpfs，会一直增长且**重启不清**。
+> khp 没有自带轮转，偶尔看一眼大小。排错时也记得看新路径，别再 tail
+> `/var/log/hid_passthrough.log`（那份不再更新）。
+
+其余各项：
 
 | 项 | 说明 |
 | --- | --- |
