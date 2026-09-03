@@ -104,14 +104,19 @@ KOReader。这是 in-app 版的 evdev 独占（grab）：不消费的话，"上�
 
 ## §1 FBInk 输入分类
 
-**PW6 上 4 个输入节点**（`/proc/bus/input/devices`，khp 守护进程运行、手柄已连）：
+**PW6 上 4 个输入节点的实际分类**（设备日志，KOReader 启动时 FBInk 自己打印，
+khp 守护进程运行、手柄已连）：
 
 ```
-event0: `bd71828-pwrkey`      = KEY | POWER_BUTTON
-event1: `pt_mt`               = TOUCHSCREEN
-event2: `gesture_tap`         = KEY | KINDLE_FRAME_TAP
-event3: `黑鲨双翼手柄L-BF5B`   = JOYSTICK | KEY          ← 唯一命中
+[FBInk] /dev/input/event0: `bd71828-pwrkey`     = KEY | POWER_BUTTON
+[FBInk] /dev/input/event1: `pt_mt`              = TOUCHSCREEN
+[FBInk] /dev/input/event2: `gesture_tap`        = KEY | KINDLE_FRAME_TAP
+[FBInk] /dev/input/event3: `黑鲨双翼手柄L-BF5B`  = JOYSTICK | KEY | MENU_BUTTON | VOLUME_BUTTONS
 ```
+
+只有 event3 带 `JOYSTICK`，`match = JOYSTICK|DPAD` 这一关就把其余三个全挡住了。
+`MENU_BUTTON` / `VOLUME_BUTTONS` 来自 KEY_MENU(139) 与 KEY_VOLUMEUP/DOWN(114/115)，
+和 `B: KEY` 位图解出来的一致（见 §11）。
 
 主分支（Scribe）那台是 7 个节点，多出 `bma4xy_acc`（ACCELEROMETER）、
 `bma4xy_feature`（ROTATION_EVENT）、`WacomDigitizer` 与 `stylus-custom`
@@ -699,9 +704,12 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
   的能力（来自 HID report descriptor），实测抓到的全是 ABS_X/Y。切到「方向键」
   模式前先确认：`cat /dev/input/event3 | xxd`，只按十字键，看有没有
   `type=3 code=16/17`。若没有，把 `supports_dpad` 改回 `false`。
-- **`event3` 这个节点号是否稳定。** 它由 uhid 按枚举顺序分配。目前 PW6 只有
-  3 个内建节点，手柄稳定落在 event3；若将来多接一个 HID 设备就会漂移。
-  掉线重连本身由 `onEvdevInputInsert` 兜住（§2），但**换了节点号要改配置**。
+- **`event3` 这个节点号能扛多少次重连。** 已实测：重新配对+重启守护进程后
+  sysfs 变成 `uhid/0005:0000:0000.0002/input/input4` —— **`inputN` 单调递增
+  （3 → 4），但 evdev handler 仍是 `event3`**，因为 `eventN` 会回收复用。
+  所以只要 3 个内建节点（event0/1/2）不变、且不同时接第二个 HID 设备，
+  手柄就稳定落在 event3。多接一个就会漂移。掉线重连本身由
+  `onEvdevInputInsert` 兜住（§2），但**换了节点号要改配置**。
 
 ---
 
