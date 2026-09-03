@@ -607,9 +607,52 @@ shell 报告的是那个 wrapper。判据看 `ps aux | grep ld-linux-armhf`。
 **`Address already in use`（`api_server.py:49 server_bind`）说明已经有一个实例在跑**，
 API 端口 8321 被占。先 `pkill -f ld-linux-armhf`。
 
+**`/var/log/hid_passthrough.log` 是追加的，多次运行混在一起。** `grep … | tail -N`
+拿到的可能是上一次运行的行 —— **看时间戳**，别把旧 run 当成当前状态。
+（改配置后验证效果时最容易在这里骗自己。）
+
 排错顺序：`tail -30 /var/log/hid_passthrough.log` → `ps aux | grep ld-linux-armhf`
 → `--diagnostics`。注意 `--diagnostics` **不打** `Config base path`，而且它那段
 `===== Daemon log tail =====` 是历史日志，别拿来当当前状态读。
+
+### config.ini 各项
+
+`[paths]` 两条迁移时必须改（见上）。其余：
+
+| 项 | 说明 |
+| --- | --- |
+| `[connection] reconnect_delay` | 掉线后重连间隔（秒） |
+| `[connection] hci_reset_timeout` / `transport_timeout` / `connect_timeout` | 等 HCI Reset、打开 `/dev/stpbt`、单次连接的上限；前两个会在 `--diagnostics` 里回显 |
+| `[transport] hci_transport` | **保持注释**。按机型自动探测，本机结果是 `file:/dev/stpbt` + `MtkChip` |
+| `[device] name` | Kindle 对外广播的名字，默认用探测到的机型 |
+| `[device] address` | 占位符 `F0:F0:…`。二进制里这个键是 `device_address`，与 `protocol` / `_parse_protocol` 相邻，是「`devices.conf` 缺失时的单设备兜底目标」（对应 `--address` 开关）。有 `devices.conf` 时**不生效** |
+| `[protocol] type` | 同上，只是兜底默认。实际协议按设备记在 `devices.conf`：`04:33:85:2C:BF:5B ble 黑鲨双翼手柄L-BF5B`。所以这里留着 `classic` 也不影响 BLE 手柄 |
+| `[logging] log_file` | 默认 `/var/log/hid_passthrough.log`，tmpfs、重启即失 |
+
+#### `[media_remote] enabled` 应改为 `false`
+
+这是「用手机音量键翻页」——把 Kindle 伪装成蓝牙音箱，手机连上来按音量键翻页。
+本插件不用它，而**开着它会让 Kindle 对外可被发现、可被连接**。
+
+二进制里 `media_remote_enabled` 出现在 `ClassicMixin._run_classic_handler` →
+`_is_classic_allowed` → `adopt` / `"[Classic] Rejecting … (not allowed)"` 这条链上，
+也出现在 `_has_devices` 的判断里。**实测 `false` 之后这三行全部消失**
+（对照两次运行的时间戳）：
+
+```
+# enabled = true
+[Media] Remote ready (A2DP sink + AVRCP target)
+[Classic] HID Host ready (PSM 0x0011, 0x0013)
+[Classic] Enabling Page Scan...          ← 对外可被发现
+Serving devices (Classic: 0, BLE: 1)
+
+# enabled = false
+Devices: 0 Classic, 1 BLE
+Serving devices (Classic: 0, BLE: 1)     ← 只剩这两行，BLE 不受影响
+```
+
+注意 Classic 设备数是 0 时它**照样**开 page scan —— 也就是说这扇门跟你有没有
+配 Classic 设备无关，只跟这个开关有关。
 
 ### 不要装的三样（即使用官方安装器）
 
