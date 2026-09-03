@@ -8,6 +8,11 @@ log/
 koreader/
 koreader-base/
 
+# kindle-hid-passthrough 守护进程（约 18.7M 三方二进制）。
+# 刻意不进仓库：git 历史是永久成本，且上游在活跃修变砖级 bug，
+# 钉死版本会让修复静默到不了手上。版本与安装步骤见 docs §11。
+khp/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

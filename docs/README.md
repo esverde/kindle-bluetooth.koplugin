@@ -441,6 +441,23 @@ end
 
 ## §11 BLE 链路（本分支专属）
 
+### 目标机器
+
+`kindle-hid-passthrough --diagnostics` 实测（这个子命令是只读的，排错先跑它）：
+
+| 项 | 值 |
+| --- | --- |
+| 型号 | Kindle PW6（device code `0xC7E`） |
+| 内核 | `5.15.41-lab126` |
+| 固件 | `042-juno_1906_sangria_bellatrix4-483216` |
+| 传输 | `file:/dev/stpbt`，`chip backend: MtkChip` |
+| `/dev/stpbt` | `crw-rw---- root bluetoot 192,0` |
+| `/dev/uhid` | 存在；`/sys/bus/hid` 存在 |
+| 已加载模块 | `wmt_cdev_bt`、`wmt_drv`（联发科 CONSYS，**不是** Linux BT 子系统） |
+
+> khp 的 README 说 MediaTek 11 代是 `4.9.77-lab126` —— PW6 是 12 代，实测
+> `5.15.41`。别照抄 README 里的内核号。
+
 ### 为什么必须靠外部守护进程
 
 **Kindle 原生栈不支持 BLE。** 这不是配置问题：PW6 上内核 BT 子系统压根没编进去，
@@ -456,6 +473,11 @@ which hciconfig hcitool bluetoothctl btmgmt   # 空
 Amazon 用的是 Bluedroid，走**厂商 HAL 直接操作 `/dev/stpbt`**，完全绕开 Linux BT
 子系统。所以 BlueZ 那条路（内核做 SMP + HoGP，设备直接出 evdev）在这台机器上
 不存在，**不必再试**。
+
+顺带一条支持 §6 那个删除决定的实测：khp 跑起来时 Amazon 那套栈**根本没在运行** ——
+`bsa_server: not running`、`btd: not running`、`btfd BTstate: 0`。khp 面对的是一块
+干净的射频。插件若去 `lipc-set-prop BTflightMode` 把 Amazon 栈拉起来，那才是
+主动制造冲突。
 
 ### 为什么不是 Sighery/kindlebt
 
@@ -491,27 +513,76 @@ characteristic，**没有任何翻页逻辑**；`turnkey` 的输入设备只实�
 **射频归 khp，插件只读 evdev。** 插件不碰蓝牙状态（§6），不实现 GATT，
 不加载任何 `.so`。终点和主分支一样是 evdev，所以 §1–§5、§7–§10 全部适用。
 
-### 守护进程：只装程序文件
+### 守护进程：手动剪裁安装
+
+版本钉在 **v3.15.2 / `BUILD_SHA = 202ef78`**（`dist/kindle_hid_passthrough/BUILD_SHA`）。
+守护进程本体**不进本仓库** —— 21M 三方二进制进 git 历史是永久成本，而且上游在活跃
+修变砖级 bug（PR #230 修 `install.sh` 把 `/` 留在读写挂载、PR #246 修 btd 被 SIGSTOP
+后再也解冻不了），钉死版本会让这些修复静默到不了手上。这个仓库还为此死过一次：
+`4adbeaf` 里的 `libkindlebt_adapter.so` 与它的 `adapter.c` 符号名已经对不上。
+
+**程序文件可迁移，配置目录不可。** 启动器用 `/proc/self/exe` + `readlink` 定位自己，
+再按相对路径加载 `dist/ld-linux-armhf.so.3` 和 `dist/main.bin`，里面没有任何
+`/mnt/us` 硬编码 —— 所以 `dist/` 跟着走。但 `main.bin` 里带着
+`/mnt/us/kindle_hid_passthrough` 这个串，且 `--help` 里**没有任何 base path 覆盖开关**
+（只有 `--pair` / `--daemon` / `--address` / `--protocol` / `--sequential` / `--diagnostics`），
+环境变量里也没有 `KHP_*`。所以拆成两处：
+
+| 位置 | 内容 | 大小 |
+| --- | --- | --- |
+| `<插件目录>/khp/` | `kindle-hid-passthrough`（**必须 `chmod +x`**）、`libsyscall_wrapper.so`、`dist/` | 18.7M |
+| `/mnt/us/kindle_hid_passthrough/` | 只留 `config.ini` + `cache/` + `devices.conf` | 几 KB |
+
+从 release 包里**丢弃**这些（21M → 18.7M）：
+
+| 丢弃 | 大小 | 理由 |
+| --- | --- | --- |
+| `dist/kindle_hid_passthrough/modules/` | 1.3M | 12 个 `uhid-*.ko`，是给 8–10 代**内核没编 `CONFIG_UHID`** 的机器补的。PW6 内核 5.15.41 原生支持（`--diagnostics` 里 `/dev/uhid: True`、`/sys/bus/hid: True`）。守护进程日志自己也写了：*"only needed to inject key events for external tools like kindle-button-mapper"* |
+| `button-mapper/` | 878K | 上游 boot loop 成因之一，见下 |
+| `koreader-plugin/` | 201K | 与本插件功能重叠（也做按键→动作映射），且它的 KOReader 动作需要开 HTTP Inspector |
+| `illusion/` | 88K | WAF app 相关 |
+| `assets/` | 6K | udev 规则 / upstart / WAF `config.xml`，三样都不装 |
+| `scripts/` | 60K | `hid-passthrough-daemon.sh` 的路径按 `/mnt/us/kindle_hid_passthrough` 写死，挪目录就不对；开关由插件自己做 |
 
 ```sh
-curl -L -o /mnt/us/khp.tar.xz \
-  https://github.com/zampierilucas/kindle-hid-passthrough/releases/latest/download/kindle-hid-passthrough-armv7.tar.xz
-mkdir -p /mnt/us/khp-release && tar -xJf /mnt/us/khp.tar.xz -C /mnt/us/khp-release
-sh /mnt/us/khp-release/scripts/install.sh installMainFiles   # 必须非交互
-/mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --pair
-setsid /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --daemon \
-  > /tmp/khp.log 2>&1 < /dev/null &
+cd /mnt/us/koreader/plugins/bluetooth.koplugin/khp
+chmod +x kindle-hid-passthrough
+setsid ./kindle-hid-passthrough --daemon > /tmp/khp.log 2>&1 < /dev/null &
+grep "Config base path" /tmp/khp.log     # 确认 base path 落在哪
 ```
 
-**必须走非交互 `installMainFiles`。** 交互菜单里没有「只装程序文件」这一项，
-唯一包含它的是 option 1 `installAll`，那个会连带装下面三样。
+**换位置后第一件事就是 grep 这一行**，它决定 `config.ini` / `cache/` / `devices.conf`
+该放哪。`--diagnostics` 不打这一行（它那段 `Daemon log tail` 是历史日志，别拿来当
+当前状态读）。
+
+### 不要装的三样（即使用官方安装器）
 
 | 跳过 | 理由 |
 | --- | --- |
-| `installUdevRules`（option 4） | 它拷 `99-hid-keyboard.rules` + `dev_is_keyboard.sh`，**把设备标记成键盘**。KOReader 2026.07 起原生接管键盘热插拔，于是它会自己开这个节点 —— 插件和 KOReader 各持一个 fd 读同一节点，evdev 给每个 fd 都投一份副本，而插件的 hook 靠 `ev.fd ~= self.opened_fd` 过滤（§9），从 KOReader 那个 fd 进来的事件消费不到，`ev.type = -1` 拦不住 → **翻两页** |
-| `installWAFApp`（option 6）/ Button Mapper（option 8） | 上游 boot loop 的成因。#226（PW6 5.19.5）与 #250（11 代）崩的都是 `mesquite` / `pillowd`，触发者是 BTManager 的 WAF scriptlet；变砖机制见 PR #230：`installAll` shell out 到 button-mapper 安装器，那个跑在 `set -e` 下可能在 `mntroot rw` 窗口里 abort，把 `/` 留在读写挂载，加上 `core_pattern` 是裸 `core` |
-| `installKOReaderPlugin`（option 7） | 与本插件功能重叠（也做按键→动作映射），且它的 KOReader 动作需要开 HTTP Inspector |
-| `installUpstart`（option 5） | 开机自启会一直占着射频（上游默认关闭，原文 *"leaves the Bluetooth radio free for audio"*） |
+| WAF app（`installWAFApp`，option 6）/ Button Mapper（option 8） | 上游 boot loop 的成因。#226（PW6 5.19.5）与 #250（11 代）崩的都是 `mesquite` / `pillowd`，触发者是 BTManager 的 WAF scriptlet；变砖机制见 PR #230：`installAll` shell out 到 button-mapper 安装器，那个跑在 `set -e` 下可能在 `mntroot rw` 窗口里 abort，把 `/` 留在读写挂载，加上 `core_pattern` 是裸 `core` |
+| 开机自启（`installUpstart`，option 5） | 会一直占着射频（上游默认关闭，原文 *"leaves the Bluetooth radio free for audio"*） |
+| udev 规则（`installUdevRules`，option 4） | **对本手柄无效，装了也白装** —— 见下 |
+
+#### udev 规则为什么对本手柄无效
+
+`assets/99-hid-keyboard.rules` + `scripts/dev_is_keyboard.sh` 的作用是给**键盘**打
+`ID_INPUT_KEYBOARD` 标记，闸门是 **KEY_Q（bit 16）**：
+
+```sh
+LAST_WORD=$(cat "$CAPS/key" | tr ' ' '\n' | tail -1)
+Q_BIT=$(( 0x$LAST_WORD & 0x10000 ))
+```
+
+本手柄的 `B: KEY=6fdb0000 0 0 0 1000 40000800 c0000 0 0 0`，**最右一组（bit 0–31）
+是 `0`**，所以 `Q_BIT = 0`，不会被打标记。既不产生效果，就没有理由去改 `/etc`。
+
+> 曾经写过「装了这条规则会让 KOReader 也把手柄当键盘打开 → 双 fd → 翻两页」——
+> **那是错的**，前提不成立，因为手柄拿不到键盘标记。这个双 fd 隐患只在
+> 真配一个蓝牙键盘时才存在；那时候要用 khp 自带的 sysfs 版本，不要用网上流传的
+> `evtest` 版本（Kindle 上不一定有 `evtest`）。
+
+规则里另一行 `KERNEL=="uhid", MODE="0660", GROUP="bluetooth"` 是把 `/dev/uhid` 放权
+给 `bluetooth` 组；以 root 跑守护进程时用不上。
 
 `start()` 只用裸 `&`，没有 `nohup`/`setsid`，SSH 断开会跟着 SIGHUP 走 ——
 所以上面用 `setsid` 自己拉。**进程名是 `ld-linux-armhf.so.3` 而不是
