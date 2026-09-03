@@ -1,6 +1,5 @@
 local DataStorage = require("datastorage")
 local Device = require("device")
-local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local LuaSettings = require("luasettings")
 local UIManager = require("ui/uimanager")
@@ -18,7 +17,6 @@ local bit = require("bit")
 local C = ffi.C
 
 local POWER_RESET_INTERVAL = 60
-local STATE_CACHE_INTERVAL = 2
 local RECONNECT_SETTLE_DELAY = 0.5  -- docs §9
 
 local DUMP_TARGETS = {
@@ -63,9 +61,6 @@ local BluetoothController = WidgetContainer:extend {
 
     opened_path = nil,
     opened_fd = nil,
-
-    _state_cached = false,
-    _state_time = nil,
 }
 
 function BluetoothController:init()
@@ -75,7 +70,6 @@ function BluetoothController:init()
         DataStorage:getSettingsDir() .. "/bluetooth_controller.lua")
     self:loadSettings()
     self.ui.menu:registerToMainMenu(self)
-    self:onDispatcherRegisterActions()
     self:registerInputHook()
     self:openDevice(false)
 end
@@ -311,67 +305,6 @@ function BluetoothController:scanJoystickDevices()
     return devices
 end
 
-local function btLipc()
-    local powerd = Device:getPowerDevice()
-    return powerd and powerd.lipc_handle
-end
-
-function BluetoothController:getRealState()
-    local lipc = btLipc()
-    if lipc then
-        local ok, state = pcall(lipc.get_int_property, lipc, "com.lab126.btfd", "BTstate")
-        if ok and type(state) == "number" then return state > 0 end
-    end
-
-    -- 走到这里说明 lipc 快路径失效了（docs §6），值得留一行
-    logger.info("BT Plugin: lipc BTstate unavailable, using shell")
-    local ok, pipe = pcall(io.popen, "lipc-get-prop com.lab126.btfd BTstate")
-    if not ok or not pipe then return false end
-    local output = pipe:read("*all")
-    pipe:close()
-    return (tonumber(output) or 0) > 0
-end
-
-function BluetoothController:getDisplayState()
-    if self._state_time and time.since(self._state_time) < time.s(STATE_CACHE_INTERVAL) then
-        return self._state_cached
-    end
-    self._state_cached = self:getRealState()
-    self._state_time = time.now()
-    return self._state_cached
-end
-
--- 只走 shell：set_int_property 没有可靠的成功返回值（docs §6）
-function BluetoothController:setBluetoothState(enable)
-    local val = enable and 0 or 1
-    local cmd = string.format("lipc-set-prop com.lab126.btfd BTflightMode %d", val)
-    if os.execute(cmd) ~= 0 then
-        logger.warn("BT Plugin: Failed to change Bluetooth state")
-        UIManager:show(InfoMessage:new { text = _("蓝牙切换失败"), timeout = 2 })
-        return false
-    end
-
-    self._state_cached = enable
-    self._state_time = time.now()
-    local msg = enable and _("蓝牙已开启") or _("蓝牙已关闭")
-    UIManager:show(InfoMessage:new { text = msg, timeout = 2 })
-    return true
-end
-
-function BluetoothController:onDispatcherRegisterActions()
-    Dispatcher:registerAction("toggle_kindle_bluetooth", {
-        category = "none",
-        event = "ToggleBluetooth",
-        title = _("切换 Kindle 蓝牙"),
-        general = true
-    })
-end
-
-function BluetoothController:onToggleBluetooth()
-    self:setBluetoothState(not self:getDisplayState())
-    return true
-end
-
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
     if self:reloadDevice() then
@@ -540,16 +473,6 @@ function BluetoothController:addToMainMenu(menu_items)
     end
 
     local sub_items = {}
-
-    table.insert(sub_items, {
-        text = _("蓝牙开关"),
-        keep_menu_open = true,
-        checked_func = function() return self:getDisplayState() end,
-        callback = function(touchmenu_instance)
-            self:setBluetoothState(not self:getDisplayState())
-            touchmenu_instance:updateItems()
-        end,
-    })
 
     table.insert(sub_items, {
         text = _("已连接设备"),

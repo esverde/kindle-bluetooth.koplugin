@@ -6,8 +6,20 @@
 改动这个插件之前先读「已核验事实」一节 —— 里面每一条都是踩坑或翻源码换来的，
 其中若干条曾经被"看起来更合理"的直觉推翻过，然后又被证据推翻回来。
 
-验证环境：**Kindle Scribe**，KOReader **v2026.07.2**，原生蓝牙栈
-（`ace_bt_cli` / `lipc` `com.lab126.btfd`，HID 经 `/dev/uhid` 落到 evdev）。
+> **本分支（BLE）与主分支（经典蓝牙）目标机型不同，配置不可互换。**
+>
+> | | 主分支 `main` | 本分支 |
+> | --- | --- | --- |
+> | 机型 | Kindle Scribe | Kindle PW6（Paperwhite 12 代，`0xC7E`） |
+> | 手柄 | Xbox Wireless Controller（经典蓝牙） | 黑鲨双翼手柄L（BLE） |
+> | 蓝牙栈 | Amazon 原生（`ace_bt_cli` / `lipc com.lab126.btfd`） | kindle-hid-passthrough（用户态 Bumble） |
+> | 轴量纲 | 0–65535，中心 32768 | **8 位有符号，中心 0，±127** |
+> | 节点 | `/dev/input/event6` | `/dev/input/event3` |
+>
+> 两条链路的终点相同 —— 都是 `/dev/uhid` → evdev，所以插件消费输入的那部分代码
+> 两边完全一致。差别只在**谁负责把 BLE 链路建起来**，见 §11。
+
+验证环境：KOReader **v2026.07.2**。
 
 ## 配置文件
 
@@ -15,13 +27,13 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| `device_path` | 手柄对应的 Linux 输入节点，例如 `/dev/input/event6`。 |
+| `device_path` | 手柄对应的 Linux 输入节点，例如 `/dev/input/event3`。 |
 | `trigger_cooldown_ms` | 两次翻页触发之间的最小间隔，单位为毫秒（0~60000）。 |
 | `invert_layout` | 是否反转上一页/下一页方向。 |
 | `supports_dpad` | 是否允许在菜单里切换摇杆/方向键模式。 |
 | `use_analog_mode` | 是否使用模拟摇杆模式；关闭时使用 D-Pad 映射。 |
-| `axis_threshold` | 模拟轴死区阈值（0~65535）。 |
-| `analog_center` | 模拟轴中心值，`analog_map` 里出现的每个轴码都必须有一项。 |
+| `axis_threshold` | 模拟轴死区阈值（0~65535）。本分支为 `95`（行程 ±127）。 |
+| `analog_center` | 模拟轴中心值，`analog_map` 里出现的每个轴码都必须有一项。本分支为 `0`。 |
 | `key_map` | 按键码到翻页方向的映射；正数为下一页，负数为上一页。 |
 | `dpad_map` | D-Pad 轴码和值到翻页方向的映射；轴码 16/17，值为 -1/0/1。 |
 | `analog_map` | 模拟轴映射；轴码 0/1，分别表示 X/Y 轴。 |
@@ -41,7 +53,7 @@
 
 ```sh
 grep "Found input device" /mnt/us/koreader/crash.log
-# BT Plugin: Found input device: Xbox Wireless Controller at /dev/input/event6 (opened=true)
+# BT Plugin: Found input device: 黑鲨双翼手柄L-BF5B at /dev/input/event3 (opened=true)
 ```
 
 **`bluetooth.lua` 是只读的**，插件永不改写它，注释和格式随你怎么写。
@@ -92,17 +104,19 @@ KOReader。这是 in-app 版的 evdev 独占（grab）：不消费的话，"上�
 
 ## §1 FBInk 输入分类
 
-**Scribe 上 7 个输入节点的实际分类**（设备日志，KOReader 启动时 FBInk 自己打印）：
+**PW6 上 4 个输入节点**（`/proc/bus/input/devices`，khp 守护进程运行、手柄已连）：
 
 ```
-event0: `bd71828-pwrkey`            = KEY | POWER_BUTTON
-event1: `bma4xy_acc`                = ACCELEROMETER
-event2: `bma4xy_feature`            = ROTATION_EVENT
-event3: `WacomDigitizer`            = TABLET | ROTATION_EVENT
-event4: `pt_mt`                     = TOUCHSCREEN
-event5: `stylus-custom`             = TABLET | ROTATION_EVENT | SCALED_TABLET
-event6: `Xbox Wireless Controller`  = JOYSTICK | KEY      ← 唯一命中
+event0: `bd71828-pwrkey`      = KEY | POWER_BUTTON
+event1: `pt_mt`               = TOUCHSCREEN
+event2: `gesture_tap`         = KEY | KINDLE_FRAME_TAP
+event3: `黑鲨双翼手柄L-BF5B`   = JOYSTICK | KEY          ← 唯一命中
 ```
+
+主分支（Scribe）那台是 7 个节点，多出 `bma4xy_acc`（ACCELEROMETER）、
+`bma4xy_feature`（ROTATION_EVENT）、`WacomDigitizer` 与 `stylus-custom`
+（TABLET）—— PW6 没有陀螺仪和手写笔，所以 §5 里那条「整链清零会连带
+干掉 `KindleScribe:init()` 注册的陀螺仪 hook」的副作用在本分支不存在。
 
 **结论：不需要设备名黑名单。** 内建设备一个都不带 `JOYSTICK`/`DPAD`，
 `match = JOYSTICK|DPAD` 这一关就全挡住了。历史上那份
@@ -147,6 +161,11 @@ SCAN_ONLY = 1U << 0U,   // Do *NOT* leave any fd's open'ed
 `You *MUST* free the returned pointer after use (it's heap allocated)`。
 
 ## §2 输入设备热插拔（uevent）
+
+> §2 与 §3 里的日志原文取自**主分支那台 Scribe**（Xbox 手柄 / `event6`），照录未改。
+> 机制与蓝牙栈无关 —— uevent 过滤条件是 `SUBSYSTEM=input` + `DEVNAME` 前缀
+> `input/event`（下表），**不看 devpath、不限 UHID**，所以 khp 经 `/dev/uhid`
+> 创建的节点走的是同一条链。本分支对应 `event3`。
 
 整条链路逐环节核验：
 
@@ -253,53 +272,26 @@ with an evdev device node… We intentionally don't filter on devpath"。
   `KindleGyroTransform`（`kindle/device.lua:1880`）一起冲掉。这是 KOReader 自身的问题，
   不是本插件造成的 —— 表现为在 Scribe 上开关"禁用按键重复"后陀螺仪旋转失效。
 
-## §6 lipc（蓝牙状态）
+## §6 lipc（蓝牙状态）—— 本分支已整段删除
 
-- `Device:getPowerDevice().lipc_handle` 是 KindlePowerD 持有的**长驻**句柄
-  （`kindle/powerd.lua:18`）。自己 `lipc.init()` + `close()` 一个反而比想省掉的 fork 更贵。
-- `get_int_property` **失败时返回 nil 而不抛错** —— KOReader 自己也是
-  `get_int_property(...) or 0`（`kindle/device.lua:304`）。所以 `pcall` 成功不代表拿到值，
-  必须判 `state`。
-- `set_int_property` 的返回值在整个 KOReader 里**都被忽略**，没有可靠的成功信号。
-  因此写状态只走 `os.execute("lipc-set-prop …")`，用退出码判断成败。
-  **不要把 lipc 句柄用回写路径**（这件事发生过一次，然后被 review 抓出来）。
-- 属性：`com.lab126.btfd` 的 `BTstate`（读）与 `BTflightMode`（写，0=开）。
-  较新的工具链倾向用 `ace_bt_cli radiostate`；`btfd` 在 Scribe 现固件上仍可用。
-- **`BTstate` 开启时实测返回 `2`，不是 `1`** —— 判断必须写 `state > 0`，写 `== 1` 会错。
+主分支用 `lipc com.lab126.btfd` 的 `BTstate` / `BTflightMode` 读写 Amazon 原生栈的
+开关状态，对应 `btLipc` / `getRealState` / `getDisplayState` / `setBluetoothState`、
+`toggle_kindle_bluetooth` 这个 Dispatcher 动作，以及菜单里的「蓝牙开关」项。
 
-### liblipclua 来自 Amazon 固件，不是 KOReader
+**本分支把这些全部删掉了（-77 行）。理由不是精简，是正确性：**
 
-`setupkoenv.lua:5-7` 的 `package.cpath` 是 `"common/?.so;common/?.dll;/usr/lib/lua/?.so;"`，
-而 KOReader 的 `common/` 里只有 `libopenlipclua.so`。所以 `require("liblipclua")`
-命中的是 **`/usr/lib/lua/liblipclua.so`（固件自带）** —— cpath 里有 `/usr/lib/lua/?.so`
-就是为了它。**固件升级若移走这个 so，快路径就会失效**，因此必须保留 shell 回退。
+BLE 链路由 kindle-hid-passthrough 建立，它**独占 `/dev/stpbt`** 直接驱动蓝牙硬件
+（绕开内核 BT 子系统 —— PW6 上 `/sys/class/bluetooth/` 根本不存在，见 §11）。
+插件再去 `lipc-set-prop com.lab126.btfd BTflightMode` 开关 Amazon 那套栈，
+等于两个进程抢同一块射频。khp 自己就踩过这个坑（上游 PR #192
+*"Fix the Bluetooth toggle getting stuck on or off"*）。
 
-### 快路径：已实测可用，决定保留
+所以本分支的原则是：**射频归 khp 管，插件只做 evdev 消费者，不碰蓝牙状态。**
 
-Scribe / 5.18.x 实测（KOReader 未运行也可跑，只读、独立的 lipc 注册名）：
-
-```sh
-ls -l /usr/lib/lua/liblipclua.so
-# -> liblipclua.so.1.0
-
-cd /mnt/us/koreader
-./luajit -e 'package.cpath="common/?.so;/usr/lib/lua/?.so;"..package.cpath
-local ok, lipc = pcall(require, "liblipclua")
-print("liblipclua:", ok)
-local h = lipc.init("com.github.koreader.bttest")
-print("handle:", tostring(h))
-print("BTstate:", pcall(h.get_int_property, h, "com.lab126.btfd", "BTstate"))
-h:close()'
-# liblipclua:  true
-# handle:      userdata: 0x...
-# BTstate:     true  2
-```
-
-`getRealState` 因此保留 lipc 快路径 + shell 回退两条。回退分支会打一行
-`lipc BTstate unavailable, using shell` —— lipc 正常时永不出现，
-出现了就说明固件动过 so 或 `powerd.lipc_handle` 为 nil。
-
-**这一条已决定，不必再作为"两套实现"提进精简清单。**
+原始的 lipc 事实（`get_int_property` 失败返回 nil 而不抛错、`set_int_property`
+没有可靠成功信号、`BTstate` 开启时返回 `2` 而不是 `1`、`liblipclua` 来自固件
+`/usr/lib/lua/` 而非 KOReader 的 `common/`）全部仍然有效，**记录在主分支的
+`docs/README.md` §6**。要在本分支重新引入蓝牙开关之前，先读那一节。
 
 ## §7 KOReader API 用法
 
@@ -393,8 +385,7 @@ if ok or err == C.ENODEV then
 | `closeDevice` 无参调用 | 只关自己开过的节点（回退到 `opened_path`，不回退到 `config.device_path`），别去动别人的 fd |
 | `onEvdevInputInsert` 里先 `unschedule` | 快速插拔时才不会堆叠出多个重连任务 |
 | `onEvdevInputRemove` 立刻关闭 | 节点消失就放掉 fd，不必等下一次 `openDevice` 去发现它已经死了 |
-| `btLipc` | 复用 KindlePowerD 的长驻句柄；自己 `lipc.init()` + `close()` 一个比它想省掉的 fork 更贵 |
-| `trigger_cooldown_ms` 在类表上 | 默认值的唯一归宿，`applyConfig` 只在配置里有合法值时覆盖 |
+| `axis_threshold` / `trigger_cooldown_ms` 直接读 `self.config` | 两者都是**必填无默认**（`applyConfig` 的 checks 表），校验过了热路径才敢直接索引 |
 | `DEVICE_TAGS` 存原文 | `_()` 在使用处调用；模块只加载一次，在表里翻译会把语言冻结在加载时刻 |
 
 ## §10 配置分两个文件
@@ -448,6 +439,150 @@ end
 `DEFAULT_PROFILE` 尤其该删：它硬编码了一个具体手柄名，把 profile 改名而忘了同步
 `active_profile` 就会导致插件拒绝启动 —— 那是"猜一个名字"，不是兜底。
 
+## §11 BLE 链路（本分支专属）
+
+### 为什么必须靠外部守护进程
+
+**Kindle 原生栈不支持 BLE。** 这不是配置问题：PW6 上内核 BT 子系统压根没编进去，
+实测四条命令全空 ——
+
+```sh
+ls /sys/class/bluetooth/     # No such file or directory
+zcat /proc/config.gz         # 无 config.gz
+lsmod | grep -E 'bluetooth|btmtk|hidp'   # 空
+which hciconfig hcitool bluetoothctl btmgmt   # 空
+```
+
+Amazon 用的是 Bluedroid，走**厂商 HAL 直接操作 `/dev/stpbt`**，完全绕开 Linux BT
+子系统。所以 BlueZ 那条路（内核做 SMP + HoGP，设备直接出 evdev）在这台机器上
+不存在，**不必再试**。
+
+### 为什么不是 Sighery/kindlebt
+
+调研过并放弃。`kindlebt` 是 Amazon 闭源 `ace_bt` 的开源包装，但：
+
+- 上游 `manual/limitations.md` 原文：*"I've noticed issues connecting Bluetooth 4.2
+  keyboards (HID)"*，而本手柄正是 BLE HID（HoGP，service `0x1812`）
+- 公开 API 里**没有任何 pairing/bonding 函数**（`bondState_t` 只是个空 typedef）
+- `ace_bt` **不能以 root 运行**，必须 root 启动后立刻 `setgid(1003); setuid(1003)`
+  降权到 `bluetooth` 用户。KOReader 不是这个身份，所以躲不开拆独立进程 ——
+  这也是上游 `turnkey` 被迫做成 gRPC daemon + 主进程双架构的原因
+- kindlebt 作者自己在 README 里把 HID 场景**指向了 kindle-hid-passthrough**
+
+顺带纠正两个容易被名字误导的仓库：`kindle-page-turner` 的 README 标题字面是
+*"Example Go application for kindle-bt-api"*，硬编码作者自己 Pico 上的 LED
+characteristic，**没有任何翻页逻辑**；`turnkey` 的输入设备只实现了一个智能戒指，
+手势→翻页的映射尚未实现。三个仓库**都没有重连/掉线处理**。
+
+本仓库 `4adbeaf` 那份 `ble_defs.lua` / `ble_manager.lua` / `ble_service.lua`
+是基于 kindlebt 的旧尝试，三层互相对不上（`ble_service.lua:39` 的 cdef 被删空、
+导出符号与 `adapter.c` 不一致、线格式一个 `[type:1][len:2]` 一个 `[len:1]`），
+且 `libkindlebt_adapter.so` 的源码已对不上二进制。**不要试图复活它。**
+
+### 链路与分工
+
+```
+黑鲨手柄 ──BLE HID(GATT notify)──> Bumble(用户态栈, /dev/stpbt)
+         ──> /dev/uhid ──> 内核解析 HID descriptor ──> /dev/input/event3
+                                                            │
+                                              本插件（普通 evdev 消费者）
+```
+
+**射频归 khp，插件只读 evdev。** 插件不碰蓝牙状态（§6），不实现 GATT，
+不加载任何 `.so`。终点和主分支一样是 evdev，所以 §1–§5、§7–§10 全部适用。
+
+### 守护进程：只装程序文件
+
+```sh
+curl -L -o /mnt/us/khp.tar.xz \
+  https://github.com/zampierilucas/kindle-hid-passthrough/releases/latest/download/kindle-hid-passthrough-armv7.tar.xz
+mkdir -p /mnt/us/khp-release && tar -xJf /mnt/us/khp.tar.xz -C /mnt/us/khp-release
+sh /mnt/us/khp-release/scripts/install.sh installMainFiles   # 必须非交互
+/mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --pair
+setsid /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --daemon \
+  > /tmp/khp.log 2>&1 < /dev/null &
+```
+
+**必须走非交互 `installMainFiles`。** 交互菜单里没有「只装程序文件」这一项，
+唯一包含它的是 option 1 `installAll`，那个会连带装下面三样。
+
+| 跳过 | 理由 |
+| --- | --- |
+| `installUdevRules`（option 4） | 它拷 `99-hid-keyboard.rules` + `dev_is_keyboard.sh`，**把设备标记成键盘**。KOReader 2026.07 起原生接管键盘热插拔，于是它会自己开这个节点 —— 插件和 KOReader 各持一个 fd 读同一节点，evdev 给每个 fd 都投一份副本，而插件的 hook 靠 `ev.fd ~= self.opened_fd` 过滤（§9），从 KOReader 那个 fd 进来的事件消费不到，`ev.type = -1` 拦不住 → **翻两页** |
+| `installWAFApp`（option 6）/ Button Mapper（option 8） | 上游 boot loop 的成因。#226（PW6 5.19.5）与 #250（11 代）崩的都是 `mesquite` / `pillowd`，触发者是 BTManager 的 WAF scriptlet；变砖机制见 PR #230：`installAll` shell out 到 button-mapper 安装器，那个跑在 `set -e` 下可能在 `mntroot rw` 窗口里 abort，把 `/` 留在读写挂载，加上 `core_pattern` 是裸 `core` |
+| `installKOReaderPlugin`（option 7） | 与本插件功能重叠（也做按键→动作映射），且它的 KOReader 动作需要开 HTTP Inspector |
+| `installUpstart`（option 5） | 开机自启会一直占着射频（上游默认关闭，原文 *"leaves the Bluetooth radio free for audio"*） |
+
+`start()` 只用裸 `&`，没有 `nohup`/`setsid`，SSH 断开会跟着 SIGHUP 走 ——
+所以上面用 `setsid` 自己拉。**进程名是 `ld-linux-armhf.so.3` 而不是
+`kindle-hid-passthrough`**（跑在打包的动态加载器下），所以：
+
+```sh
+ps aux | grep 'ld-linux-armhf' | grep -v grep   # 查
+pkill -f ld-linux-armhf                          # 停
+```
+
+### 实测数值
+
+| 项 | 实测值 | 出处 |
+| --- | --- | --- |
+| 常驻内存 | **RSS 33060 KB ≈ 32.3 MB**（VSZ 37728 KB，CPU 2.4%，总内存 956 MB） | `ps aux` |
+| 轴量纲 | **8 位有符号，中心 0，极值 ±127** | `event3` 原始字节，见下 |
+| 按键码 | 304 305 307 308 310 311 312 313 314 315 317 318 | `B: KEY` 位图解码 |
+| 方向键 | 存在（ABS_HAT0X/Y） | `B: ABS=307bf` bit 16/17 |
+
+「Bumble 太重」这个判断被 32 MB / 3.3% 推翻了 —— 和当年「菜单卡顿」量出
+`fbink_input_scan` 只花 2.2ms 是同一类：先量，再判。
+
+**轴量纲的解码过程**（32 位 ARM 的 `input_event` = `tv_sec`+`tv_usec`+`type`+`code`+`value`，共 16 字节）：
+
+```
+0300 0000 7f00 0000   type=3(EV_ABS) code=0(ABS_X) value=+127
+0300 0000 81ff ffff   type=3          code=0        value=-127
+0300 0100 cfff ffff   type=3          code=1(ABS_Y) value=-49
+```
+
+**按键位图的解码过程**。`/proc/bus/input/devices` 的 `B: KEY` 按 unsigned long
+分组打印，**最右一组是 bit 0–31，往左每组 +32**：
+
+```
+B: KEY=6fdb0000 0 0 0 1000 40000800 c0000 0 0 0
+        └ bit 288-319                    └ bit 96-127
+0x6fdb0000 → 组内 bit 16,17,19,20,22,23,24,25,26,27,29,30
+           → +288 = 304,305,307,308,310,311,312,313,314,315,317,318
+```
+
+这两份数据把旧配置里**猜的**值全部证实了：`axis_center = 0`、`axis_max = 127`、
+以及那串 304/305/307/308/310/312。旧配置唯一猜错的是 `supports_dpad = false` ——
+`ABS=307bf` 表明 HAT0X/Y 存在，本分支改为 `true`。
+
+### FBInk 会把 event3 判成 JOYSTICK
+
+逐条走 `fbink_input_scan.c` 的 `test_pointers` if/else 链：
+
+| 分支 | 需要的位 | event3 | 结果 |
+| --- | --- | --- | --- |
+| `has_abs_coordinates` | ABS_X(0) && ABS_Y(1) | 都有 | 进入判定 |
+| `stylus_or_pen` | BTN_TOOL_PEN | 无 | 跳过 |
+| `finger_but_no_pen` | BTN_TOOL_FINGER | 无 | 跳过 |
+| `has_mouse_button` | BTN_LEFT/RIGHT/MIDDLE (272-274) | 无 | 跳过 |
+| `has_touch` | BTN_TOUCH (330) | 无（位图只印到 bit 319 那组，说明 ≥320 全 0） | 跳过 |
+| `has_joystick_axes_or_buttons` | `BTN_A \|\| BTN_TRIGGER \|\| BTN_1 \|\| ABS_RX \|\| …` | BTN_A(304) ✓、ABS_RX(3) ✓ | **is_joystick** |
+
+`exclude = INPUT_TOUCHSCREEN` 不会误命中：`has_mt_coordinates` 要
+ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` 返回 true，
+`openDevice` 原样可用 —— **设备名是中文不影响**，分类只看能力位，不看名字。
+
+### 尚未验证
+
+- **方向键实际是否发 HAT 事件。** `ABS=307bf` 只证明设备**声明**了 HAT0X/Y
+  的能力（来自 HID report descriptor），实测抓到的全是 ABS_X/Y。切到「方向键」
+  模式前先确认：`cat /dev/input/event3 | xxd`，只按十字键，看有没有
+  `type=3 code=16/17`。若没有，把 `supports_dpad` 改回 `false`。
+- **`event3` 这个节点号是否稳定。** 它由 uhid 按枚举顺序分配。目前 PW6 只有
+  3 个内建节点，手柄稳定落在 event3；若将来多接一个 HID 设备就会漂移。
+  掉线重连本身由 `onEvdevInputInsert` 兜住（§2），但**换了节点号要改配置**。
+
 ---
 
 # 验证方法
@@ -490,8 +625,7 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 
 | 菜单项 | 期待日志 | 另外确认 |
 | --- | --- | --- |
-| 蓝牙开关 | 成功时无日志；失败才有 `Failed to change Bluetooth state` | 提示「蓝牙已开启 / 已关闭」 |
-| 已连接设备 | `Found input device: …` | 只列手柄，不含手写笔/触屏 |
+| 已连接设备 | `Found input device: …` | 只列手柄，不含触屏/frame tap |
 | 反转方向 | `Saved override invert_layout` | **重启后仍然反转** |
 | 摇杆模式 → 方向键 | `Saved override use_analog_mode` | **重启后仍是方向键** |
 | 重新加载设备 | `Loaded config for` → `Closing device` → `Opened device` | — |
