@@ -30,12 +30,12 @@ local DUMP_TARGETS = {
     } },
 }
 
-local _shared_last_trigger_time = nil
-local _shared_last_power_reset_time = nil
+local _shared_last_trigger_time
+local _shared_last_power_reset_time
 local _shared_hook_registered = false
 local _shared_triggered = false
 local _shared_axis_values = {}
-local _current_active_controller = nil
+local _current_active_controller
 local _fbink_input
 local _fbink_input_masks
 local _fbink_input_checked = false
@@ -127,13 +127,6 @@ function BluetoothController:applyConfig(cfg)
     resetInputState()
     logger.info("BT Plugin: Loaded config for " .. cfg.device_path)
     return true
-end
-
--- LuaSettings:flush 自带原子写 + .old 备份 + fsync（luasettings.lua:270）
-function BluetoothController:saveOverride(key, value)
-    self.settings:saveSetting(key, value)
-    self.settings:flush()
-    logger.info("BT Plugin: Saved override " .. key)
 end
 
 function BluetoothController:registerInputHook()
@@ -246,7 +239,7 @@ function BluetoothController:closeDevice(path)
 
     if self:isDeviceOpened(path) then
         logger.info("BT Plugin: Closing device " .. path)
-        local _, err = pcall(Device.input.close, Device.input, path)
+        local _ok, err = pcall(Device.input.close, Device.input, path)
         if self:isDeviceOpened(path) then
             logger.warn("BT Plugin: Failed to close " .. path .. " -> " .. tostring(err or "still open"))
             return false
@@ -354,9 +347,7 @@ end
 
 function BluetoothController:handleInputEvent(ev)
     -- 只认手柄那一个 fd（docs §9）
-    if not self.opened_fd or ev.fd ~= self.opened_fd then
-        return
-    end
+    if not self.opened_fd or ev.fd ~= self.opened_fd then return end
 
     local direction = self:parseInputDirection(ev)
     if not direction then return end
@@ -372,9 +363,7 @@ end
 function BluetoothController:parseInputDirection(ev)
     if ev.type == C.EV_KEY and (ev.value == 1 or ev.value == 2) then
         -- KOReader 的重复键过滤 hook 排在我们之后，必须自己认（docs §5）
-        if ev.value == 2 and G_reader_settings:isTrue("input_no_key_repeat") then
-            return nil
-        end
+        if ev.value == 2 and G_reader_settings:isTrue("input_no_key_repeat") then return nil end
         return self.config.key_map[ev.code]
     end
 
@@ -397,8 +386,8 @@ function BluetoothController:parseAnalogInput(ev)
 
     -- 全部映射轴都回中才解锁，否则一次推杆会连翻（docs §4）
     if deviation <= threshold then
-        for axis_code, axis_deviation in pairs(_shared_axis_values) do
-            if analog_map[axis_code] and axis_deviation > threshold then return nil end
+        for _axis, axis_deviation in pairs(_shared_axis_values) do
+            if axis_deviation > threshold then return nil end
         end
         _shared_triggered = false
         return nil
@@ -414,11 +403,7 @@ function BluetoothController:parseAnalogInput(ev)
     _shared_triggered = true
     _shared_last_trigger_time = time.now()
 
-    if ev.value < center then
-        return mapping.low_dir
-    else
-        return mapping.high_dir
-    end
+    return ev.value < center and mapping.low_dir or mapping.high_dir
 end
 
 function BluetoothController:cleanupBluetoothDumps()
@@ -438,8 +423,7 @@ function BluetoothController:cleanupBluetoothDumps()
     end
 
     if #paths > 0 then
-        local command = "rm -rf -- " .. util.shell_escape(paths) .. " 2>/dev/null"
-        if os.execute(command) ~= 0 then
+        if os.execute("rm -rf -- " .. util.shell_escape(paths) .. " 2>/dev/null") ~= 0 then
             logger.warn("BT Plugin: Failed to remove bluetooth dumps")
             return false
         end
@@ -506,7 +490,9 @@ function BluetoothController:addToMainMenu(menu_items)
         checked_func = function() return self.config.invert_layout end,
         callback = function()
             self.config.invert_layout = not self.config.invert_layout
-            self:saveOverride("invert_layout", self.config.invert_layout)
+            self.settings:saveSetting("invert_layout", self.config.invert_layout)
+            -- flush 自带原子写 + .old 备份 + fsync（luasettings.lua:270）
+            self.settings:flush()
         end
     })
 
