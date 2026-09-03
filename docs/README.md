@@ -92,7 +92,7 @@ KOReader。这是 in-app 版的 evdev 独占（grab）：不消费的话，"上�
 - 时间计算全部使用单调时钟（`time.now()`）。用 `os.time()` 会在 Kindle 联网校时
   往回跳时把节流窗口永久冻住（差值变负数，恒小于阈值）。
 - 模拟摇杆同时使用"回到死区"和时间冷却两层去抖。
-- 蓝牙状态查询带 2 秒缓存，避免菜单每次重绘都 fork 一个进程。
+- 守护进程存活性查询（`isDaemonRunning`）**不带缓存**，见 §12。
 - 手柄掉线与重连**完全由 uevent 事件驱动**，没有任何定时轮询或唤醒重连（见 §3）。
 - 配置分两个文件：手写的只读，机器写的另存（见 §10）。落盘交给 `LuaSettings`，
   原子写、`.old` 备份、fsync 都由它负责，插件不再手写这套逻辑。
@@ -975,9 +975,22 @@ util.shell_escape({ self.path .. "/khp/dist/main.bin" })
 **不主动 `reloadDevice()`。** 节点是手柄连上时才出现的，可能晚于那 6 秒；
 而那条路已经由 `onEvdevInputInsert` 兜住（§2，已实测）。
 
-`checked_func` 会在每次菜单重绘时被调用，所以 `isDaemonRunning` 带 2 秒缓存
-（`DAEMON_CACHE_INTERVAL`），否则每次重绘都 fork 一个 `pgrep` —— 与主分支给
-蓝牙状态加缓存是同一个理由。
+### `isDaemonRunning` 刻意不带缓存
+
+`checked_func` 每次菜单重绘都会调它，所以最初照主分支给蓝牙状态加缓存的做法，
+也加了 2 秒缓存。后来删掉了：**代价与收益不成比例**。
+
+- 收益：省掉一次 `pgrep` 的 fork，约几毫秒。
+- 代价：两个状态字段（`_daemon_cached` / `_daemon_time`）、一个常量、
+  以及两处手动失效（起停之后必须 `self._daemon_time = nil`，漏一处就会显示
+  过期状态最多 2 秒）。
+
+而 e-ink 菜单重绘本身就是 100ms 量级，几毫秒的 fork 是噪声 —— 而且这个开销
+**从没量过**。主分支那个缓存包的是 `lipc` 加 `io.popen` 回退，量级不同，
+不能直接类比过来。
+
+`self.path` 在 `init` 里固定，所以 `_daemon_binary` 和 `_daemon_pattern`
+（含 `shell_escape`）都在那里算一次，不用每次重新拼。
 
 ---
 

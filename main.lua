@@ -18,8 +18,7 @@ local C = ffi.C
 
 local POWER_RESET_INTERVAL = 60
 local RECONNECT_SETTLE_DELAY = 0.5  -- docs §9
-local DAEMON_CACHE_INTERVAL = 2     -- 秒，菜单重绘不必每次 fork 一个 pgrep
-local DAEMON_START_DELAY = 6        -- 秒，实测约 3s 起完，留一倍余量
+local DAEMON_START_DELAY = 6        -- 秒，实测节点约 5s 后出现（docs §12）
 
 local DUMP_TARGETS = {
     { directory = "/mnt/us", patterns = {
@@ -70,6 +69,10 @@ function BluetoothController:init()
     self.config = {}
     self.settings = LuaSettings:open(
         DataStorage:getSettingsDir() .. "/bluetooth_controller.lua")
+    -- 匹配完整路径，不用 khp 自己脚本里的 'ld-linux-armhf.'（会命中任何
+    -- 用同名加载器起的进程）。self.path 固定，算一次就够。
+    self._daemon_binary = self.path .. "/khp/kindle-hid-passthrough"
+    self._daemon_pattern = util.shell_escape({ self.path .. "/khp/dist/main.bin" })
     self:loadSettings()
     self.ui.menu:registerToMainMenu(self)
     self:registerInputHook()
@@ -306,43 +309,28 @@ function BluetoothController:scanJoystickDevices()
 end
 
 -- khp 守护进程：只需要「在 / 不在」两态，用信号起停就够了（docs §12）
-function BluetoothController:khpPath(name)
-    return self.path .. "/khp/" .. name
-end
-
--- 匹配完整路径，不用 khp 自己脚本里的 'ld-linux-armhf.' —— 那个模式会命中
--- 任何用同名加载器起的进程
-function BluetoothController:daemonPattern()
-    return util.shell_escape({ self:khpPath("dist/main.bin") })
-end
-
 function BluetoothController:isDaemonRunning()
-    if self._daemon_time and time.since(self._daemon_time) < time.s(DAEMON_CACHE_INTERVAL) then
-        return self._daemon_cached
-    end
-    self._daemon_cached = os.execute("pgrep -f " .. self:daemonPattern() .. " >/dev/null 2>&1") == 0
-    self._daemon_time = time.now()
-    return self._daemon_cached
+    return os.execute("pgrep -f " .. self._daemon_pattern .. " >/dev/null 2>&1") == 0
 end
 
 function BluetoothController:startDaemon()
-    local binary = self:khpPath("kindle-hid-passthrough")
-    if lfs.attributes(binary, "mode") ~= "file" then
-        logger.warn("BT Plugin: khp binary missing at " .. binary)
+    -- khp/ 在 .gitignore 里，「新克隆后二进制不存在」是最可能的实际场景。
+    -- 少了这一判，症状会退化成 6 秒后一句误导性的「守护进程已停止」。
+    if lfs.attributes(self._daemon_binary, "mode") ~= "file" then
+        logger.warn("BT Plugin: khp binary missing at " .. self._daemon_binary)
         return false
     end
     -- setsid 让它脱离 KOReader 的进程组，否则 KOReader 退出会把它一起带走
     os.execute(string.format("setsid %s --daemon >/dev/null 2>&1 </dev/null &",
-        util.shell_escape({ binary })))
+        util.shell_escape({ self._daemon_binary })))
     logger.info("BT Plugin: khp daemon start requested")
     return true
 end
 
 function BluetoothController:stopDaemon()
     -- SIGTERM，与 khp 自带 daemon.sh 的 stop() 一致
-    os.execute("pkill -f " .. self:daemonPattern())
+    os.execute("pkill -f " .. self._daemon_pattern)
     logger.info("BT Plugin: khp daemon stop requested")
-    return true
 end
 
 function BluetoothController:_reconnect()
@@ -503,18 +491,16 @@ function BluetoothController:addToMainMenu(menu_items)
                 return
             end
             if not starting then self:stopDaemon() end
-            self._daemon_time = nil
             UIManager:show(InfoMessage:new{
                 text = starting and _("正在启动守护进程…") or _("正在停止守护进程…"),
                 timeout = 2,
             })
 
-            -- 起停都不同步：`&` 与 pkill 之后 shell 立刻返回，实测约 3s 才就绪。
+            -- 起停都不同步：`&` 与 pkill 之后 shell 立刻返回，实测约 5s 才就绪。
             -- 存成字段是为了能在 onExit 里 unschedule —— 匿名闭包会持有 self，
             -- 也就连带持有 ReaderUI（这类泄漏在本仓库出现过一次）。
             UIManager:unschedule(self._daemon_check)
             self._daemon_check = function()
-                self._daemon_time = nil
                 UIManager:show(InfoMessage:new{
                     text = self:isDaemonRunning() and _("守护进程已启动")
                         or _("守护进程已停止"),
