@@ -452,7 +452,7 @@ function BluetoothController:parseAnalogInput(ev)
     local mapping = analog_map[ev.code]
     if not mapping then return nil end
 
-    local center = self.config.analog_center[ev.code] or AXIS_CENTER_DEFAULT
+    local center = self.config.analog_center[ev.code]
     local threshold = self.config.axis_threshold
     local deviation = math.abs(ev.value - center)
 
