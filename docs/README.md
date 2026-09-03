@@ -521,17 +521,41 @@ characteristic，**没有任何翻页逻辑**；`turnkey` 的输入设备只实�
 后再也解冻不了），钉死版本会让这些修复静默到不了手上。这个仓库还为此死过一次：
 `4adbeaf` 里的 `libkindlebt_adapter.so` 与它的 `adapter.c` 符号名已经对不上。
 
-**程序文件可迁移，配置目录不可。** 启动器用 `/proc/self/exe` + `readlink` 定位自己，
-再按相对路径加载 `dist/ld-linux-armhf.so.3` 和 `dist/main.bin`，里面没有任何
-`/mnt/us` 硬编码 —— 所以 `dist/` 跟着走。但 `main.bin` 里带着
-`/mnt/us/kindle_hid_passthrough` 这个串，且 `--help` 里**没有任何 base path 覆盖开关**
-（只有 `--pair` / `--daemon` / `--address` / `--protocol` / `--sequential` / `--diagnostics`），
-环境变量里也没有 `KHP_*`。所以拆成两处：
+**整个目录可迁移，不需要任何环境变量；但 `config.ini` 里的绝对路径必须改。**
+
+- **启动器**（ARM 静态 ELF）用 `/proc/self/exe` + `readlink` 定位自己，再按相对路径
+  加载 `dist/ld-linux-armhf.so.3` 和 `dist/main.bin`。里面**没有任何 `/mnt/us` 硬编码**。
+- **base path** 由 `Config._determine_base_path` 解析，顺序是
+  `os.environ["KINDLE_HID_BASE"]` → **exe 所在目录** → 硬编码默认值
+  `/mnt/us/kindle_hid_passthrough`。实测从 `khp/` 直接跑（不设任何环境变量）
+  就打出 `Config base path: /mnt/us/koreader/plugins/bluetooth.koplugin/khp`
+  —— 所以 `KINDLE_HID_BASE` 是可用的覆盖手段，但迁移**用不到**它。
+  （另有 `KINDLE_HID_DEBUG` 可用于排错。`--help` 里没有对应的命令行开关。）
+- **但 `config.ini` 内部两条是绝对路径**，base path 变了它们不会跟着变：
+
+  ```ini
+  cache_dir      = <base>/cache
+  devices_config = <base>/devices.conf
+  ```
+
+  不改的症状是**静默用旧目录**（日志里 `Using device from
+  /mnt/us/kindle_hid_passthrough/devices.conf: …`），此时删旧目录就断。迁移时：
+
+  ```sh
+  cp -a /mnt/us/kindle_hid_passthrough/cache /mnt/us/kindle_hid_passthrough/devices.conf .
+  sed -i 's#/mnt/us/kindle_hid_passthrough#'"$PWD"'#g' config.ini
+  ```
+
+所以全部放一处即可：
 
 | 位置 | 内容 | 大小 |
 | --- | --- | --- |
-| `<插件目录>/khp/` | `kindle-hid-passthrough`（**必须 `chmod +x`**）、`libsyscall_wrapper.so`、`dist/` | 18.7M |
-| `/mnt/us/kindle_hid_passthrough/` | 只留 `config.ini` + `cache/` + `devices.conf` | 几 KB |
+| `<插件目录>/khp/` | `kindle-hid-passthrough`（**必须 `chmod +x`**）、`libsyscall_wrapper.so`、`dist/`、`config.ini`、`cache/`、`devices.conf` | 18.7M |
+
+> `dist/kindle_hid_passthrough/config.ini`（661B）**保留**。`_module_search_dirs`
+> 证明 `<base>/dist/kindle_hid_passthrough/` 是打包资源查找目录（`modules/` 也在
+> 那儿），那份 config 可能是 freeze 时带进来的默认值，也可能是 fallback ——
+> 从二进制里分不出来。为省 661 字节去赌一个未知不值得。
 
 从 release 包里**丢弃**这些（21M → 18.7M）：
 
@@ -547,13 +571,27 @@ characteristic，**没有任何翻页逻辑**；`turnkey` 的输入设备只实�
 ```sh
 cd /mnt/us/koreader/plugins/bluetooth.koplugin/khp
 chmod +x kindle-hid-passthrough
-setsid ./kindle-hid-passthrough --daemon > /tmp/khp.log 2>&1 < /dev/null &
-grep "Config base path" /tmp/khp.log     # 确认 base path 落在哪
+setsid ./kindle-hid-passthrough --daemon > /dev/null 2>&1 < /dev/null &
+sleep 8 && grep -E "base path|devices.conf|Keystore|Serving" \
+  /var/log/hid_passthrough.log | tail -6
 ```
 
-**换位置后第一件事就是 grep 这一行**，它决定 `config.ini` / `cache/` / `devices.conf`
-该放哪。`--diagnostics` 不打这一行（它那段 `Daemon log tail` 是历史日志，别拿来当
-当前状态读）。
+### 排错：三个会误导人的现象
+
+**重定向 stdout 会得到一个空日志。** Python 在 stdout 不是 TTY 时走块缓冲，
+守护进程一直活着就一直不 flush，`> /tmp/khp.log` 拿到的是空文件。
+**看它自己那份日志**（`config.ini` 的 `log_file`，默认 `/var/log/hid_passthrough.log`，
+在 tmpfs 上、重启即失）。要看 stdout 就前台跑 `./kindle-hid-passthrough --daemon 2>&1 | tee …`。
+
+**`[1]+ Done` 不代表守护进程死了。** `setsid` 在不是进程组长时 fork 后自己立刻退出，
+shell 报告的是那个 wrapper。判据看 `ps aux | grep ld-linux-armhf`。
+
+**`Address already in use`（`api_server.py:49 server_bind`）说明已经有一个实例在跑**，
+API 端口 8321 被占。先 `pkill -f ld-linux-armhf`。
+
+排错顺序：`tail -30 /var/log/hid_passthrough.log` → `ps aux | grep ld-linux-armhf`
+→ `--diagnostics`。注意 `--diagnostics` **不打** `Config base path`，而且它那段
+`===== Daemon log tail =====` 是历史日志，别拿来当当前状态读。
 
 ### 不要装的三样（即使用官方安装器）
 
