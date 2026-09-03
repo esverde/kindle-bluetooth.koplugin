@@ -386,6 +386,8 @@ if ok or err == C.ENODEV then
 | `RECONNECT_SETTLE_DELAY = 0.5` | 节点刚建好时驱动可能还没就绪；与 `externalkeyboard.koplugin` 取同值。这是硬件时序旋钮，机器不同可能要调 |
 | `isNumberInRange` | 不单独判 NaN/±inf —— 它们过不了 `>=` / `<=` 比较 |
 | `applyConfig` 的字段归一化 | 全局唯一的配置校验点，因此输入热路径（`parseInputDirection` 及以下）不再逐字段查类型 |
+| `applyConfig` 用 `for k,v in pairs(cfg)` 整表拷贝 | 不逐字段枚举赋值 —— 那样每加一个配置项都要在这里同步一次，漏一个就是「改了配置不生效」。拷完再单独覆盖唯一那个可被菜单改的项 |
+| `startDaemon` 先 `lfs.attributes` 判存在 | `khp/` 在 `.gitignore` 里，「新克隆后守护进程二进制不存在」是最可能的实际场景。少了这一判，症状会从「找不到守护进程」退化成 6 秒后一句误导性的「守护进程已停止」 |
 | `opened_fd` 字段 | 开设备时记下 fd，输入热路径上省一次表查。每次 open 后必须重读 —— 实测同一手柄在不同会话里拿到过 13 和 16 |
 | `handleInputEvent` 的 fd 闸门 | 只认手柄那一个 fd，触屏事件在此被挡住，所以不需要额外的 `ABS_MT`（轴码 ≥ 47）预过滤。保留 `not self.opened_fd or` 判空是因为无法证明不存在 `ev.fd == nil` 的事件路径 |
 | `closeDevice` 无参调用 | 只关自己开过的节点（回退到 `opened_path`，不回退到 `config.device_path`），别去动别人的 fd |

@@ -69,8 +69,7 @@ function BluetoothController:init()
     self.config = {}
     self.settings = LuaSettings:open(
         DataStorage:getSettingsDir() .. "/bluetooth_controller.lua")
-    -- 匹配完整路径，不用 khp 自己脚本里的 'ld-linux-armhf.'（会命中任何
-    -- 用同名加载器起的进程）。self.path 固定，算一次就够。
+    -- 匹配完整路径而非 'ld-linux-armhf.'，算一次即可（docs §12）
     self._daemon_binary = self.path .. "/khp/kindle-hid-passthrough"
     self._daemon_pattern = util.shell_escape({ self.path .. "/khp/dist/main.bin" })
     self:loadSettings()
@@ -96,17 +95,14 @@ function BluetoothController:loadSettings()
     return self:applyConfig(file_config)
 end
 
--- 取值顺序：菜单写的覆盖值 > bluetooth.lua。不存在第三层兜底。
--- 必须显式判 nil 而不能写 `readSetting(key) or from_file`：覆盖值为 false 时
--- 会被 or 吃掉、退回文件里的值（docs §10 记了这个坑的实际症状）。
+-- 覆盖值 > bluetooth.lua，无第三层兜底。判 nil 而非 `or` 的理由见 docs §10
 function BluetoothController:override(key, from_file)
     local value = self.settings:readSetting(key)
     if value == nil then return from_file end
     return value
 end
 
--- 全部字段必填且必须合法，任何一项不过关就整份拒绝、运行态不动（docs §10）。
--- 这是唯一的校验点，通过之后输入热路径可以直接索引，不再逐字段重查。
+-- 唯一的校验点：全部字段必填，一项不过关就整份拒绝（docs §10、§9）
 function BluetoothController:applyConfig(cfg)
     local checks = {
         { "device_path",         isDevicePath(cfg.device_path) },
@@ -131,7 +127,7 @@ function BluetoothController:applyConfig(cfg)
         end
     end
 
-    -- 整表拷贝，避免逐字段枚举（每加一个配置项都要同步一次），再覆盖唯一那项
+    -- 整表拷贝而非逐字段枚举（docs §9），再覆盖唯一那项
     self.config = {}
     for k, v in pairs(cfg) do
         self.config[k] = v
@@ -314,8 +310,7 @@ function BluetoothController:isDaemonRunning()
 end
 
 function BluetoothController:startDaemon()
-    -- khp/ 在 .gitignore 里，「新克隆后二进制不存在」是最可能的实际场景。
-    -- 少了这一判，症状会退化成 6 秒后一句误导性的「守护进程已停止」。
+    -- khp/ 被 gitignore，二进制缺失是最可能的实际场景（docs §9）
     if lfs.attributes(self._daemon_binary, "mode") ~= "file" then
         logger.warn("BT Plugin: khp binary missing at " .. self._daemon_binary)
         return false
@@ -496,9 +491,7 @@ function BluetoothController:addToMainMenu(menu_items)
                 timeout = 2,
             })
 
-            -- 起停都不同步：`&` 与 pkill 之后 shell 立刻返回，实测约 5s 才就绪。
-            -- 存成字段是为了能在 onExit 里 unschedule —— 匿名闭包会持有 self，
-            -- 也就连带持有 ReaderUI（这类泄漏在本仓库出现过一次）。
+            -- 起停不同步，故延时回查；存成字段是为了能 unschedule（docs §12）
             UIManager:unschedule(self._daemon_check)
             self._daemon_check = function()
                 UIManager:show(InfoMessage:new{
@@ -507,8 +500,7 @@ function BluetoothController:addToMainMenu(menu_items)
                     timeout = 2,
                 })
             end
-            -- 不主动 reloadDevice：节点是手柄连上时才出现的，可能晚于这个延时，
-            -- 而那条路已经由 onEvdevInputInsert 兜住（docs §2，已实测）
+            -- 不主动 reloadDevice，那条路由 onEvdevInputInsert 兜住（docs §12）
             UIManager:scheduleIn(starting and DAEMON_START_DELAY or 1, self._daemon_check)
         end,
     })
