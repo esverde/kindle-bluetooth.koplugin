@@ -94,6 +94,8 @@ function BluetoothController:loadSettings()
 end
 
 -- 取值顺序：菜单写的覆盖值 > bluetooth.lua。不存在第三层兜底。
+-- 必须显式判 nil 而不能写 `readSetting(key) or from_file`：覆盖值为 false 时
+-- 会被 or 吃掉、退回文件里的值（docs §10 记了这个坑的实际症状）。
 function BluetoothController:override(key, from_file)
     local value = self.settings:readSetting(key)
     if value == nil then return from_file end
@@ -108,7 +110,6 @@ function BluetoothController:applyConfig(cfg)
         { "trigger_cooldown_ms", isNumberInRange(cfg.trigger_cooldown_ms, 0, 60000) },
         { "axis_threshold",      isNumberInRange(cfg.axis_threshold, 0, 65535) },
         { "key_map",             type(cfg.key_map) == "table" },
-        { "dpad_map",            type(cfg.dpad_map) == "table" },
         { "analog_map",          type(cfg.analog_map) == "table" },
         { "analog_center",       type(cfg.analog_center) == "table" },
     }
@@ -127,15 +128,12 @@ function BluetoothController:applyConfig(cfg)
         end
     end
 
-    -- 整表拷贝，避免逐字段枚举（每加一个配置项都要同步一次），再覆盖三项
+    -- 整表拷贝，避免逐字段枚举（每加一个配置项都要同步一次），再覆盖唯一那项
     self.config = {}
     for k, v in pairs(cfg) do
         self.config[k] = v
     end
-    self.config.supports_dpad = cfg.supports_dpad == true
     self.config.invert_layout = self:override("invert_layout", cfg.invert_layout) == true
-    -- 不能用 or：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
-    self.config.use_analog_mode = self:override("use_analog_mode", cfg.use_analog_mode) == true
     resetInputState()
     logger.info("BT Plugin: Loaded config for " .. cfg.device_path)
     return true
@@ -405,21 +403,12 @@ function BluetoothController:parseInputDirection(ev)
         return self.config.key_map[ev.code]
     end
 
+    -- 本手柄只有摇杆，没有十字键，所以 EV_ABS 只有一条路（docs §11）
     if ev.type == C.EV_ABS then
-        if self.config.use_analog_mode then
-            return self:parseAnalogInput(ev)
-        else
-            return self:parseDpadInput(ev)
-        end
+        return self:parseAnalogInput(ev)
     end
 
     return nil
-end
-
-function BluetoothController:parseDpadInput(ev)
-    if ev.value == 0 then return nil end
-    local axis_map = self.config.dpad_map[ev.code]
-    return axis_map and axis_map[ev.value]
 end
 
 function BluetoothController:parseAnalogInput(ev)
@@ -500,20 +489,6 @@ local DEVICE_TAGS = {
 }
 
 function BluetoothController:addToMainMenu(menu_items)
-    local function joystickModeItem(text, analog)
-        return {
-            text = text,
-            checked_func = function()
-                return self.config.use_analog_mode == analog
-            end,
-            callback = function()
-                self.config.use_analog_mode = analog
-                resetInputState()
-                self:saveOverride("use_analog_mode", analog)
-            end,
-        }
-    end
-
     local sub_items = {}
 
     table.insert(sub_items, {
@@ -580,17 +555,6 @@ function BluetoothController:addToMainMenu(menu_items)
             self.config.invert_layout = not self.config.invert_layout
             self:saveOverride("invert_layout", self.config.invert_layout)
         end
-    })
-
-    table.insert(sub_items, {
-        text = _("摇杆模式"),
-        enabled_func = function()
-            return self.config.supports_dpad
-        end,
-        sub_item_table = {
-            joystickModeItem(_("模拟摇杆"), true),
-            joystickModeItem(_("方向键"), false),
-        }
     })
 
     table.insert(sub_items, {

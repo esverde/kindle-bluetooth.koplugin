@@ -29,14 +29,15 @@
 | --- | --- |
 | `device_path` | 手柄对应的 Linux 输入节点，例如 `/dev/input/event3`。 |
 | `trigger_cooldown_ms` | 两次翻页触发之间的最小间隔，单位为毫秒（0~60000）。 |
-| `invert_layout` | 是否反转上一页/下一页方向。 |
-| `supports_dpad` | 是否允许在菜单里切换摇杆/方向键模式。 |
-| `use_analog_mode` | 是否使用模拟摇杆模式；关闭时使用 D-Pad 映射。 |
+| `invert_layout` | 是否反转上一页/下一页方向。**本分支唯一可被菜单覆盖的项**。 |
 | `axis_threshold` | 模拟轴死区阈值（0~65535）。本分支为 `95`（行程 ±127）。 |
 | `analog_center` | 模拟轴中心值，`analog_map` 里出现的每个轴码都必须有一项。本分支为 `0`。 |
 | `key_map` | 按键码到翻页方向的映射；正数为下一页，负数为上一页。 |
-| `dpad_map` | D-Pad 轴码和值到翻页方向的映射；轴码 16/17，值为 -1/0/1。 |
 | `analog_map` | 模拟轴映射；轴码 0/1，分别表示 X/Y 轴。 |
+
+> 主分支还有 `supports_dpad` / `use_analog_mode` / `dpad_map` 三项，用于在菜单里
+> 切换摇杆/方向键模式。**本分支没有** —— 黑鲨手柄只有摇杆 + 四个面键 + 两个
+> 肩键，没有十字键，那条模式切换在这台机器上是不可达的死路径（§11）。
 
 改完配置后用菜单「重新加载设备」生效，插件会先释放旧节点再打开新节点。
 
@@ -57,8 +58,8 @@ grep "Found input device" /mnt/us/koreader/crash.log
 ```
 
 **`bluetooth.lua` 是只读的**，插件永不改写它，注释和格式随你怎么写。
-菜单能改的两项（反转方向、摇杆模式）写到另一个文件，见 §10 ——
-其中也包括「改了 `bluetooth.lua` 里那两项却不生效」这个后果。
+菜单能改的那一项（反转方向）写到另一个文件，见 §10 ——
+其中也包括「改了 `bluetooth.lua` 里那一项却不生效」这个后果。
 
 ## 输入设备边界
 
@@ -400,24 +401,23 @@ if ok or err == C.ENODEV then
 | 文件 | 谁写 | 内容 |
 | --- | --- | --- |
 | `<插件目录>/bluetooth.lua` | **只有用户**，插件永不改写 | 全部配置字段（见开头那张表） |
-| `<settings>/bluetooth_controller.lua` | 只有插件（`LuaSettings`） | `invert_layout`、`use_analog_mode` 两个覆盖值 |
+| `<settings>/bluetooth_controller.lua` | 只有插件（`LuaSettings`） | `invert_layout` 一个覆盖值（主分支还有 `use_analog_mode`） |
 
 取值顺序只有两层：**覆盖值 > `bluetooth.lua`**，由 `override(key, from_file)`
 统一实现 —— 只在覆盖值为 `nil` 时回退，所以显式的 `false` 不会被误当作"未设置"。
 
 ### 后果：菜单改过的项，改 bluetooth.lua 不再生效
 
-`invert_layout` 和 `use_analog_mode` 一旦在菜单里点过，就以覆盖文件为准。
-要交回文件控制，删掉覆盖文件里对应的键，或直接删掉整个
-`<settings>/bluetooth_controller.lua`。
+`invert_layout` 一旦在菜单里点过，就以覆盖文件为准。要交回文件控制，
+删掉覆盖文件里对应的键，或直接删掉整个 `<settings>/bluetooth_controller.lua`。
 
 这是 KOReader 自己的模型（`defaults.lua` 给默认、`settings.reader.lua` 存覆盖）。
 
 ### 陷阱：读覆盖值不能用 `or`
 
 ```lua
--- 错：覆盖值为 false（方向键模式）时会被吃掉，退回文件里的 true
-local mode = self:override("use_analog_mode", cfg.use_analog_mode) or cfg.use_analog_mode
+-- 错：覆盖值为 false 时会被吃掉，退回文件里的值
+local v = self:override("invert_layout", cfg.invert_layout) or cfg.invert_layout
 -- 对：override 内部只判 nil
 function BluetoothController:override(key, from_file)
     local value = self.settings:readSetting(key)
@@ -426,8 +426,10 @@ function BluetoothController:override(key, from_file)
 end
 ```
 
-症状是"选了方向键，重启后变回模拟摇杆"，只有重启才暴露 —— 所以验证表里
-专门列了「重启后仍是方向键」这一项。
+**这个坑只在覆盖值是布尔时存在，而本分支的覆盖值全是布尔。**
+主分支上它的实际症状是"选了方向键，重启后变回模拟摇杆"（那一项已删，见 §11）；
+本分支等价的症状是"关掉反转方向，重启后又反转了"。只有重启才暴露 ——
+所以验证表里专门列了「重启后仍然反转」这一项。
 
 ### 这次拆分与单手柄化删掉的代码
 
@@ -690,7 +692,9 @@ B: KEY=6fdb0000 0 0 0 1000 40000800 c0000 0 0 0
 所以位图的正确用法是：**没声明的一定不发**（可用于排除），**声明了的不一定发**
 （不可用于确认）。这一条是踩出来的 —— 按位图把 `supports_dpad` 设成 `true`、
 把肩键映射成 `310/311`，两处都错，各自的症状是「切到方向键模式后彻底翻不了页」
-和「一个肩键是死键」。**凡是要写进 `key_map` / `dpad_map` 的码，逐个实按。**
+和「一个肩键是死键」。**凡是要写进 `key_map` 的码，逐个实按。**
+
+（`supports_dpad` 这个字段后来整个删掉了 —— 见下。）
 
 抓键码的办法（`g4=0100` 是 EV_KEY，`g5` 是键码小端，`g6=0100` 是按下）：
 
@@ -739,19 +743,33 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
 
 **功能验证到此完整**，验证方法一节的菜单表每一项都点过。
 
-### 两个遗留注意事项（不是待测项）
+### 摇杆/方向键模式切换：本分支整个删掉了
 
-**`use_analog_mode` 的覆盖值在本分支测不到，但可能把人锁死。**
-`supports_dpad = false` 让「摇杆模式」菜单项禁用，所以这条覆盖值正常情况下
-永远写不进去。但**若在 `supports_dpad` 还是 `true` 的那几个版本里误切过
-「方向键」**，覆盖值 `false` 已经存进 `<settings>/bluetooth_controller.lua`，
-而现在菜单是灰的、切不回来 —— 症状是完全不翻页。解法是手删那一项：
+黑鲨手柄只有摇杆 + 四个面键 + 两个肩键，**没有十字键**，所以模式切换在这台
+机器上是不可达的死路径。删掉的东西：
 
-```sh
-grep use_analog_mode /mnt/us/koreader/settings/bluetooth_controller.lua
-```
+| 位置 | 删掉的 |
+| --- | --- |
+| `bluetooth.lua` | `supports_dpad`、`use_analog_mode`、`dpad_map` |
+| `applyConfig` | `dpad_map` 的类型校验、`supports_dpad` 与 `use_analog_mode` 两行赋值 |
+| `parseInputDirection` | `EV_ABS` 的二选一分支，直接走 `parseAnalogInput` |
+| `main.lua` | `parseDpadInput`、`joystickModeItem`、「摇杆模式」菜单项 |
 
-**`event3` 这个节点号会漂移。** 已实测：重新配对+重启守护进程后 sysfs 变成
+**留着它不是中性的，它是一个陷阱的来源。** `supports_dpad = false` 会让「摇杆
+模式」菜单项变灰，于是**若在 `supports_dpad` 还是 `true` 的那几个版本里误切过
+「方向键」**，覆盖值 `false` 已经落进 `<settings>/bluetooth_controller.lua`，
+而菜单已经灰了、切不回来 —— 症状是完全不翻页。删掉整条路径之后
+`use_analog_mode` 根本不再被读取，这个坑就**不可能发生**了
+（残留的旧覆盖值会被静默忽略，无需清理）。
+
+> 曾经的判断是「保留 dpad 代码，删了每次 `git merge main` 都要处理冲突」。
+> 那个权衡算错了：主分支的 dpad 代码是完成态、极少改动，冲突成本接近零；
+> 而保留它的代价是一个能把人锁死的 footgun。**merge 便利不值得用一个已知
+> 陷阱去换。**
+
+### `event3` 这个节点号会漂移
+
+已实测： 重新配对+重启守护进程后 sysfs 变成
 `uhid/0005:0000:0000.0002/input/input4` —— **`inputN` 单调递增（3 → 4），
 但 evdev handler 仍是 `event3`**，因为 `eventN` 会回收复用。所以只要 3 个内建
 节点（event0/1/2）不变、且不同时接第二个 HID 设备，手柄就稳定落在 event3。
@@ -881,14 +899,15 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 | 蓝牙守护进程 → 关 | `khp daemon stop requested` → 同一秒 `Input device removed` → `Closing device` | 提示「已停止」；`ko-input` 打出 `Closed input device with fd: N` |
 | 已连接设备 | `Found input device: …` | 只列手柄，不含触屏/frame tap |
 | 反转方向 | `Saved override invert_layout` | **重启后仍然反转** |
-| 摇杆模式 → 方向键 | `Saved override use_analog_mode` | **重启后仍是方向键** |
 | 重新加载设备 | `Loaded config for` → `Closing device` → `Opened device` | — |
 | 清理蓝牙垃圾 | `Cleaned up bluetooth dump files` | — |
 
-「另外确认」里那两个**重启后**是配置拆分（§10）的关键验证点：覆盖值存在
+（主分支还有一项「摇杆模式 → 方向键」，本分支已删，见 §11。）
+
+「另外确认」里那个**重启后**是配置拆分（§10）的关键验证点：覆盖值存在
 `<settings>/bluetooth_controller.lua`，读取时若误用 `or` 而非判 `nil`，
-显式的 `false`（方向键模式）就会被 `bluetooth.lua` 里的 `true` 顶掉 ——
-表现正是"选了方向键，重启后变回模拟摇杆"。
+显式的 `false` 就会被 `bluetooth.lua` 里的值顶掉 —— 表现是"关掉反转方向，
+重启后又反转了"。这一项**只有重启才暴露**。
 
 功能验证：摇杆推一下能翻页，**且触屏依然正常**（后者验证 fd 闸门 ——
 触屏失灵说明 `opened_fd` 匹配错了，事件被误吃）。
