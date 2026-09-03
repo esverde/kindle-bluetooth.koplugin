@@ -653,8 +653,9 @@ pkill -f ld-linux-armhf                          # 停
 | --- | --- | --- |
 | 常驻内存 | **RSS 33060 KB ≈ 32.3 MB**（VSZ 37728 KB，CPU 2.4%，总内存 956 MB） | `ps aux` |
 | 轴量纲 | **8 位有符号，中心 0，极值 ±127** | `event3` 原始字节，见下 |
-| 按键码 | 304 305 307 308 310 311 312 313 314 315 317 318 | `B: KEY` 位图解码 |
-| 方向键 | 存在（ABS_HAT0X/Y） | `B: ABS=307bf` bit 16/17 |
+| 按键码（**声明**） | 304 305 307 308 310 311 312 313 314 315 317 318 | `B: KEY` 位图解码 |
+| 按键码（**实发**） | 304 305 307 308 310 **312** | 逐个实按 |
+| 方向键 | **不存在**（物理上没有十字键） | 只按方向键时收不到 `code=16/17` |
 
 「Bumble 太重」这个判断被 32 MB / 3.3% 推翻了 —— 和当年「菜单卡顿」量出
 `fbink_input_scan` 只花 2.2ms 是同一类：先量，再判。
@@ -677,9 +678,29 @@ B: KEY=6fdb0000 0 0 0 1000 40000800 c0000 0 0 0
            → +288 = 304,305,307,308,310,311,312,313,314,315,317,318
 ```
 
-这两份数据把旧配置里**猜的**值全部证实了：`axis_center = 0`、`axis_max = 127`、
-以及那串 304/305/307/308/310/312。旧配置唯一猜错的是 `supports_dpad = false` ——
-`ABS=307bf` 表明 HAT0X/Y 存在，本分支改为 `true`。
+### ⚠️ 位图只能用来排除，不能用来确认
+
+**这个手柄的 HID report descriptor 声明的能力比它实际有的多。** 两处实证：
+
+| 声明 | 实际 |
+| --- | --- |
+| `ABS=307bf` 含 bit 16/17（ABS_HAT0X/Y） | **物理上没有十字键**，只按方向键时一个 `code=16/17` 都不发 |
+| `B: KEY` 声明 12 个键 | 实按只有 6 个发：304 305 307 308 310 312。**311(BTN_TR) 不发** —— 这是「左翼」单体，311 属于右翼那一半 |
+
+所以位图的正确用法是：**没声明的一定不发**（可用于排除），**声明了的不一定发**
+（不可用于确认）。这一条是踩出来的 —— 按位图把 `supports_dpad` 设成 `true`、
+把肩键映射成 `310/311`，两处都错，各自的症状是「切到方向键模式后彻底翻不了页」
+和「一个肩键是死键」。**凡是要写进 `key_map` / `dpad_map` 的码，逐个实按。**
+
+抓键码的办法（`g4=0100` 是 EV_KEY，`g5` 是键码小端，`g6=0100` 是按下）：
+
+```sh
+cat /dev/input/event3 | xxd | grep ' 0100 '
+# 3601=310(BTN_TL)  3701=311(BTN_TR)  3801=312(BTN_TL2)  3901=313(BTN_TR2)
+```
+
+反过来，旧配置（`4adbeaf`）里那些**猜的**值倒是全对：`axis_center = 0`、
+`axis_max = 127`、`supports_dpad = false`，以及肩键那对 **310/312**。
 
 ### FBInk 会把 event3 判成 JOYSTICK
 
@@ -698,12 +719,24 @@ B: KEY=6fdb0000 0 0 0 1000 40000800 c0000 0 0 0
 ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` 返回 true，
 `openDevice` 原样可用 —— **设备名是中文不影响**，分类只看能力位，不看名字。
 
+### 已在真机验证
+
+- FBInk 分类命中 `JOYSTICK`，`isControllerDevice` 返回 true
+- `Loaded config for /dev/input/event3` → `Opened device /dev/input/event3`
+- 「已连接设备」列出手柄、「清理蓝牙垃圾」正常
+- **摇杆翻页正常**（`GotoViewRel` 无日志，靠肉眼确认）
+- **重启后配置正常加载**
+- khp 迁移彻底：`config.ini` 两条路径指向 `khp/`，`devices.conf` 与
+  `cache/{pairing_keys.json,04_33_85_2C_BF_5B.json}` 均在 `khp/` 内
+
 ### 尚未验证
 
-- **方向键实际是否发 HAT 事件。** `ABS=307bf` 只证明设备**声明**了 HAT0X/Y
-  的能力（来自 HID report descriptor），实测抓到的全是 ABS_X/Y。切到「方向键」
-  模式前先确认：`cat /dev/input/event3 | xxd`，只按十字键，看有没有
-  `type=3 code=16/17`。若没有，把 `supports_dpad` 改回 `false`。
+- **菜单两个覆盖项的重启持久化。** 「反转方向」应打 `Saved override
+  invert_layout` 且重启后仍反转（§10 的关键验证点，历史上出过 `or` 吃掉
+  `false` 的 bug）。「摇杆模式」在本手柄上不可用（`supports_dpad = false`
+  使菜单项禁用），所以 `use_analog_mode` 那条覆盖值在本分支测不到 ——
+  若之前误存过 `false`，得手删 `<settings>/bluetooth_controller.lua` 里那一项，
+  否则会停在收不到事件的方向键模式且无法从菜单切回。
 - **`event3` 这个节点号能扛多少次重连。** 已实测：重新配对+重启守护进程后
   sysfs 变成 `uhid/0005:0000:0000.0002/input/input4` —— **`inputN` 单调递增
   （3 → 4），但 evdev handler 仍是 `event3`**，因为 `eventN` 会回收复用。
