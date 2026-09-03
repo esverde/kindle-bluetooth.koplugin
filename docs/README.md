@@ -847,7 +847,8 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
 - FBInk 分类命中 `JOYSTICK`，`isControllerDevice` 返回 true
 - `Loaded config for /dev/input/event3` → `Opened device /dev/input/event3`
 - 「已连接设备」列出手柄、「清理蓝牙垃圾」正常
-- **摇杆翻页正常**（`GotoViewRel` 无日志，靠肉眼确认）
+- **摇杆翻页正常**（`GotoViewRel` 无日志，靠肉眼确认）—— 删掉模式切换、
+  `parseInputDirection` 的 `EV_ABS` 改成单路之后**重新验过一次**
 - **四个面键与两个肩键（310/312）翻页正常**
 - **重启后配置正常加载**
 - **「反转方向」重启后仍然反转**（`Saved override invert_layout`）—— §10 的
