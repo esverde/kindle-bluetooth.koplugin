@@ -572,8 +572,14 @@ characteristic，**没有任何翻页逻辑**；`turnkey` 的输入设备只实�
 cd /mnt/us/koreader/plugins/bluetooth.koplugin/khp
 chmod +x kindle-hid-passthrough
 setsid ./kindle-hid-passthrough --daemon > /dev/null 2>&1 < /dev/null &
-sleep 8 && grep -E "base path|devices.conf|Keystore|Serving" \
-  /var/log/hid_passthrough.log | tail -6
+sleep 8 && grep -E "Keystore|Serving devices" /var/log/hid_passthrough.log | tail -4
+```
+
+期待 `Serving devices (Classic: 0, BLE: 1)`。确认迁移是否彻底则**直接看文件**，
+不用重启守护进程：
+
+```sh
+grep -A3 '\[paths\]' config.ini && ls -l devices.conf && ls cache/
 ```
 
 ### 排错：三个会误导人的现象
@@ -581,7 +587,12 @@ sleep 8 && grep -E "base path|devices.conf|Keystore|Serving" \
 **重定向 stdout 会得到一个空日志。** Python 在 stdout 不是 TTY 时走块缓冲，
 守护进程一直活着就一直不 flush，`> /tmp/khp.log` 拿到的是空文件。
 **看它自己那份日志**（`config.ini` 的 `log_file`，默认 `/var/log/hid_passthrough.log`，
-在 tmpfs 上、重启即失）。要看 stdout 就前台跑 `./kindle-hid-passthrough --daemon 2>&1 | tee …`。
+在 tmpfs 上、重启即失）。
+
+**两份日志内容不一样，别在错的那份里 grep。** `>>>` 前缀那些行
+（`Detected Kindle …`、`Config base path: …`、`Using device from …/devices.conf: …`）
+是**控制台输出，不走 Python logger**，`/var/log/hid_passthrough.log` 里没有。
+要看它们只能前台跑：`./kindle-hid-passthrough --daemon 2>&1 | head -8`。
 
 **`[1]+ Done` 不代表守护进程死了。** `setsid` 在不是进程组长时 fork 后自己立刻退出，
 shell 报告的是那个 wrapper。判据看 `ps aux | grep ld-linux-armhf`。
