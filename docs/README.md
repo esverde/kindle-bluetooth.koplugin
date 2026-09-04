@@ -1155,6 +1155,20 @@ function _M.open(host, port, create)
 | 显示 `battery_updated` 新鲜度 | 值本来就最多滞后 5 分钟，菜单场景无意义 |
 | 为未配置的设备也读电量 | 得按 MAC 逐个查、多次 HTTP，而只有在用那台值得关心 |
 
+### pcall 罩住全部可失败操作，不只罩 JSON 解析
+
+第一版把 `popen` + `read` 留在 `readBatteryLevel` 里，只把解析放进 `pcall`。
+结果是 **`popen` 那半裸着** —— `io.popen` 返回 nil 时后面的 `pipe:read` 会直接
+崩掉菜单，所以又得补一行 `if not pipe then return nil end` 守卫。
+
+现在的形状：`fetchBatteryLevel` 里做 popen + read + close + decode + 匹配，
+`readBatteryLevel` 只剩两件事 —— `pgrep` 门禁和一个 `pcall`。一个边界罩住全部，
+于是 nil 守卫、`body or ""`、`data.connections or {}` 这些补丁全都不需要了
+（少 7 行）。
+
+**`or {}` 那类守卫删掉反而更好**：API 换结构时会走进 `logger.dbg` 留下线索，
+加了 `or {}` 只会静默返回 nil，问题被藏起来。
+
 ### 两个必须保留的判断
 
 **`isDaemonRunning()` 门禁。** `readBatteryLevel` 第一件事是 `pgrep`，守护进程
