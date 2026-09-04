@@ -1010,6 +1010,22 @@ kill -TERM "$PID"
 跟守护进程对话。本插件只要开关，进程存活性 `pgrep` 就够，
 `socket.http` + 超时 + JSON 解析 + 轮询状态机全是白背的复杂度。
 
+上游源码印证了这个判断：`api_server.py` 的 `/stop` **只停 HID 层、留着 API
+server**（好让下次 `/start` 快），所以它的插件必须区分三态。我们 `pkill` 整个
+进程，就只有「在 / 不在」。**那个状态机是「用 API 停」的产物，不是守护进程的
+固有性质。**
+
+### 分界线：信号管控制，API 只管无其他来源的只读数据
+
+上面那条**不是**「永不碰 API」。分界是：
+
+| 用途 | 走哪条 | 理由 |
+| --- | --- | --- |
+| 起停守护进程 | **信号**（`pgrep` / `pkill`） | 只有两态，有更简单的替代 |
+| 手柄电量 | **API**（`/status`） | **没有别的来源**：evdev 不带电量，`/sys/class/power_supply/` 里也没有 hid 电量节点（实测只有 Kindle 自己的 `bd71827_bat` 等三个），详见 §13 |
+
+判据是「有没有更简单的替代」，不是「API 本身脏」。
+
 ### 一处比上游更准
 
 khp 脚本用 `pgrep -f "ld-linux-armhf."`，这个模式**太宽** —— 会命中任何用同名
@@ -1051,9 +1067,10 @@ util.shell_escape({ self.path .. "/khp/dist/main.bin" })
   KOReader UI 线程最多 15 秒**，e-ink 上就是整机假死。
 - 延时回调**只弹 InfoMessage，不碰菜单控件** —— 用户可能已经关掉菜单，
   在死控件上 `updateItems` 是自找麻烦。状态由 `checked_func` 下次重绘时自然刷新。
-- 回调**存成 `self._daemon_check` 字段**而不是匿名闭包，这样 `onExit` 能
+- 回调是**方法 `self:_daemonCheck()`** 而不是匿名闭包，这样 `onExit` 能
   `unschedule` 掉。匿名闭包会持有 `self`，也就连带持有 ReaderUI ——
-  这类泄漏在本仓库出现过一次。
+  这类泄漏在本仓库出现过一次。排程时按 `_reconnect` 的同一形状传
+  `scheduleIn(delay, self._daemonCheck, self)`。
   （`UIManager:unschedule(nil)` 是安全空操作：每个已排程任务的 `action` 都非 nil，
   `uimanager.lua:440` 的比较不会命中。）
 
@@ -1076,6 +1093,108 @@ util.shell_escape({ self.path .. "/khp/dist/main.bin" })
 
 `self.path` 在 `init` 里固定，所以 `_daemon_binary` 和 `_daemon_pattern`
 （含 `shell_escape`）都在那里算一次，不用每次重新拼。
+
+## §13 手柄电量：为什么走 HTTP、为什么用 wget
+
+「已连接设备」里显示的 `98%` 来自 khp 的 API。三条路只有一条通：
+
+| 路径 | 结论 |
+| --- | --- |
+| evdev | **不通**。输入事件里没有电量信息 |
+| 内核 HID 电量（`/sys/class/power_supply/hid-*-battery`） | **不通**。实测该目录只有 `bd71827_ac`(Mains)、`bd71827_bat`(Kindle 自己的电池)、`max20342_moisture`(USB_WET)，**没有 hid 电量节点** |
+| khp 的 `/status` | **通**，见下 |
+
+数据链路：手柄的 GATT Battery Service（0x180F）→ khp 的 `ble.py` 订阅通知、
+不通知的设备每 `BATTERY_POLL_INTERVAL = 300` 秒主动读一次 → `host.py` 的
+`battery_level` → HTTP `/status`。所以**值最多滞后 5 分钟**，菜单场景够用。
+
+### 用 `input_paths` 匹配，不用 MAC
+
+`/status` 的实测输出（`3.15.2-202ef78`）：
+
+```json
+"connections": [{
+  "address": "04:33:85:2C:BF:5B",
+  "input_paths": ["/dev/input/event2"],
+  "battery_level": 98,
+  "battery_updated": 1788515691.4
+}]
+```
+
+`input_paths` 直接给出 evdev 节点，所以按 `device_path` 匹配即可 —— 那本来就是
+本插件唯一认的设备身份（§9）。khp 自己的插件按 `address` 匹配，我们不需要多引入
+一个身份维度。
+
+> 顺带：`name` 是 `黑鲨双翼手柄L-BF5B`，尾巴 `BF5B` 来自 MAC 的后两字节。这就是
+> `display_name` 要存在的原因（见开头字段表）。
+
+### 用 `wget` 而不是 `socket.http`
+
+**`koreader/common/socket/http.lua:122-130` 有个坑**：
+
+```lua
+function _M.open(host, port, create)
+    local c = socket.try(create())
+    ...
+    h.try(c:settimeout(_M.TIMEOUT))   ← 覆盖掉 create 里设的超时
+```
+
+`create()` 里 `settimeout()` 会被随后的 `settimeout(_M.TIMEOUT)` 冲掉。所以
+**khp 插件里那个 `create = function() … s:settimeout(…) end` 块是死代码**，真正
+生效的是模块全局 `http.TIMEOUT`。而改模块全局有风险：中途抛异常没恢复的话，
+别的 KOReader HTTP 调用会继承这个短超时。
+
+`wget -qO- -T 2` 没有这个问题：超时可靠、无全局状态、少一层依赖，而且本文件
+已经在 shell out（`pgrep` / `pkill` / `setsid` / `rm`），是同一个惯用法。
+
+### 三个刻意不做
+
+| 不做 | 理由 |
+| --- | --- |
+| 轮询 + 定时器 + 失败闩锁 | khp 插件要在状态栏常驻显示所以必须轮询（`BATTERY_POLL_INTERVAL` / `_startBatteryPoll` / `battery_unavailable`）。我们只在菜单里显示，**按需读**就够，那三样全省掉 |
+| 显示 `battery_updated` 新鲜度 | 值本来就最多滞后 5 分钟，菜单场景无意义 |
+| 为未配置的设备也读电量 | 得按 MAC 逐个查、多次 HTTP，而只有在用那台值得关心 |
+
+### 两个必须保留的判断
+
+**`isDaemonRunning()` 门禁。** `readBatteryLevel` 第一件事是 `pgrep`，守护进程
+不在就直接返回，连 `wget` 都不 fork。这是最常见的情形，也避免了在 #88 那种射频
+卡死状态下白等 2 秒。
+
+**`type(conn.battery_level) == "number"` 判断不能删。** 手柄没有 Battery Service
+时该字段是 JSON `null`，而 rapidjson 把 `null` 解成 `rapidjson.null`
+（**userdata，不是 nil**）。少了这个判断，`string.format("%d", …)` 会直接报错。
+
+### 已知副作用
+
+KOReader 的**菜单搜索**也会调 `sub_item_table_func`（`touchmenu.lua:1005`），
+所以搜索菜单时会多 fork 一次 `wget`。有 `pgrep` 门禁 + 2 秒超时，最坏 2 秒卡顿。
+这和 `scanJoystickDevices` 被菜单搜索触发一次 FBInk 扫描是同一类既有行为，
+不是本功能引入的。
+
+### API 端点全表（`3.15.2-202ef78`，`127.0.0.1:8321`，全为 GET）
+
+从 `api_server.py` 的 `match path:` 提取，留着免得下次再翻源码：
+
+| 端点 | 参数 | 作用 |
+| --- | --- | --- |
+| `/health` | — | 只回 `{"ok":true}` |
+| `/status` | — | 全量状态，含 `battery_level` / `input_paths` / `autostart` |
+| `/devices` | — | 已配对设备列表 |
+| `/start` | — | 起 HID 层（**不是起进程**） |
+| `/stop` | — | 停 HID 层，**留着 API server** ← 三态的来源 |
+| `/scan` `/scan-status` | — | 扫描与轮询 |
+| `/pair` `/pair-status` | `addr` `protocol` `name` | 配对与轮询 |
+| `/connect` | `addr` `protocol` | 连接 |
+| `/disconnect` `/remove` | `addr` | 断开 / 删除配对 |
+| `/discoverable` | `duration` | 让 Kindle 可被发现 |
+| `/logs` | `lines` | 日志尾部 |
+| `/clear-cache` | — | 清缓存 |
+| `/autostart` | `enable` | 开关 upstart 自启 |
+
+> `/autostart?enable=1` 能免去手写 upstart 脚本。但**暂不建议开**：自启意味着
+> 开机就攥着射频，于是每次开 WiFi 都得先停它（§12）。等「先连 WiFi 再起守护
+> 进程」这套流程用稳了再说。
 
 ### ⚠️ 守护进程运行期间不要开关 WiFi —— 会把射频卡死到重启
 

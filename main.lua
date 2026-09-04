@@ -308,6 +308,40 @@ function BluetoothController:stopDaemon()
     logger.info("BT Plugin: khp daemon stop requested")
 end
 
+-- 电量只能从 khp 的 API 拿：evdev 不带这个信息，内核也没建 hid 电量节点（docs §13）
+local BATTERY_CMD = "wget -qO- -T 2 http://127.0.0.1:8321/status 2>/dev/null"
+
+local function parseBatteryLevel(body, device_path)
+    local data = require("rapidjson").decode(body)
+    for _i, conn in ipairs(data.connections or {}) do
+        for _j, path in ipairs(conn.input_paths or {}) do
+            -- 按节点匹配而非 MAC：device_path 是插件唯一认的身份（docs §9）
+            if path == device_path then
+                -- JSON null 被解成 rapidjson.null（userdata），不是 nil
+                return type(conn.battery_level) == "number"
+                    and conn.battery_level or nil
+            end
+        end
+    end
+end
+
+function BluetoothController:readBatteryLevel()
+    -- pgrep 比 fork 一个 wget 便宜得多，守护进程不在就别费劲
+    if not self:isDaemonRunning() then return nil end
+
+    local pipe = io.popen(BATTERY_CMD)
+    if not pipe then return nil end
+    local body = pipe:read("*all")
+    pipe:close()
+
+    -- 没有电量不算错误：手柄可能没有 Battery Service，API 结构也可能变
+    local ok, level = pcall(parseBatteryLevel, body or "", self.config.device_path)
+    if not ok then
+        logger.dbg("BT Plugin: battery parse failed: " .. tostring(level))
+    end
+    return ok and level or nil
+end
+
 -- 起停不同步，故延时回查（docs §12）
 function BluetoothController:_daemonCheck()
     UIManager:show(InfoMessage:new{
@@ -479,7 +513,12 @@ function BluetoothController:addToMainMenu(menu_items)
                 local tag = DEVICE_TAGS[is_configured][dev.opened]
                 -- 只替本机配置那一台的名字；其余保留 evdev 原名，方便认节点
                 local name = is_configured and self.config.display_name or dev.name
-                table.insert(items, { text = name .. tag })
+                -- 只为配置那一台读电量：一次菜单打开最多一个 HTTP 请求
+                local level = is_configured and self:readBatteryLevel()
+                table.insert(items, {
+                    text = level and string.format("%s %d%%%s", name, level, tag)
+                        or name .. tag,
+                })
             end
             return items
         end,
