@@ -1017,27 +1017,41 @@ BT 芯片，而那段代码是整个项目最脆弱的部分，为一个边缘�
 **症状**：WiFi 搜不到网络、连不上。**恢复**：只能重启 Kindle —— 一旦卡住，
 停守护进程也救不回来。
 
-**规避（顺序问题）**：
+**冲突只发生在 WiFi 状态转换的瞬间** —— khp 攥着芯片时去 cycle 它才会炸。
+所以规避有两条路，第二条更省事：
 
-1. 菜单里关掉「蓝牙守护进程」，等到提示「守护进程已停止」；
-2. 开 WiFi，连好，用完；
-3. 再把守护进程起回来。
+1. **每次动 WiFi 前先停守护进程**：菜单关掉「蓝牙守护进程」→ 等提示「守护进程
+   已停止」→ 开 WiFi 用完 → 再起守护进程。
+2. **先把 WiFi 连好，再起守护进程**（推荐）。整个阅读期间不发生 WiFi 状态转换，
+   就不触发冲突。
 
-#### 真正危险的是 KOReader 自己会偷偷开关 WiFi
+> 第 2 条是从 #88 的机制推出来的，**尚未在真机验证**。验法：WiFi 连好 → 起
+> 守护进程 → 确认手柄能翻页且 WiFi 仍在线。
 
-比手动切换更容易踩的是这两个设置，它们会在你不碰任何东西的时候 cycle 射频。
-用守护进程期间**两个都应该关掉**：
+#### KOReader 那两个自动开关 WiFi 的设置：默认就是关的
 
-| KOReader 设置项（网络菜单） | 内部键 | 为什么危险 |
+有两个设置会在你不碰任何东西的时候 cycle 射频。**但它们默认关闭，绝大多数情况
+下不需要动**——这里记下来只是为了排除嫌疑，别把它们当成本问题的原因。
+
+| KOReader 设置项 | 内部键 | 为什么危险 |
 |---|---|---|
 | Restore Wi-Fi connection on resume | `auto_restore_wifi` | 帮助文字原文是「automatically and **silently** re-connect to Wi-Fi on startup or on resume」。带手柄看书时唤醒极其频繁，等于随机时刻 cycle 射频（`manager.lua:984-993`） |
 | Disable Wi-Fi connection when inactive | `auto_disable_wifi` | 空闲一段时间后自动关 WiFi（`networklistener.lua:85-185`）。KOReader 自己的帮助文字就说这项在原生 Kindle 上「unlikely to function properly」 |
+
+**菜单路径**：设置齿轮 → 网络 → 第 3、4 项，紧跟在「Wi-Fi 连接」和「代理」
+之后（`reader_menu_order.lua:132-137`）。两项在 Kindle 上一定显示，因为两个
+gate 都过：`getNetworkInterfaceName()` 在 Kindle 上硬编码返回 `"wlan0"`
+（`device/kindle/device.lua:449`），`hasWifiRestore = yes`（同文件 L394）。
 
 查当前值：
 
 ```sh
 grep -E 'auto_(restore|disable)_wifi' /mnt/us/koreader/settings.reader.lua
 ```
+
+**没有输出是正常的，且意味着两项都是关的。** `defaults.lua` 里没有这两个键，
+代码用 `flipNilOrFalse` + `isTrue`，默认 nil 即关；KOReader 只把改过的设置
+落盘。所以「grep 不到」不是没找对地方，是压根没开过。
 
 #### 顺带排除的一个误判方向
 
