@@ -17,8 +17,8 @@ local bit = require("bit")
 local C = ffi.C
 
 local POWER_RESET_INTERVAL = 60
-local RECONNECT_SETTLE_DELAY = 0.5  -- docs §9
-local DAEMON_START_DELAY = 6        -- 秒，实测节点约 5s 后出现（docs §12）
+local RECONNECT_SETTLE_DELAY = 0.5
+local DAEMON_START_DELAY = 6
 
 local DUMP_TARGETS = {
     { directory = "/mnt/us", patterns = {
@@ -61,10 +61,9 @@ local BluetoothController = WidgetContainer:extend {
 function BluetoothController:init()
     if not Device:isKindle() then return end
     self.config = {}
-    -- self.settings 存菜单可改的覆盖值，见 docs §10
     self.settings = LuaSettings:open(
         DataStorage:getSettingsDir() .. "/bluetooth_controller.lua")
-    -- 匹配完整路径而非 'ld-linux-armhf.'，算一次即可（docs §12）
+    -- 必须匹配完整路径，短模式会误伤别的进程（docs §12）
     self._daemon_binary = self.path .. "/khp/kindle-hid-passthrough"
     self._daemon_pattern = util.shell_escape({ self.path .. "/khp/dist/main.bin" })
     self:loadSettings()
@@ -73,7 +72,6 @@ function BluetoothController:init()
     self:openDevice(false)
 end
 
--- bluetooth.lua 只读：插件从不改写它（docs §10）
 function BluetoothController:loadSettings()
     local loader = loadfile(self.path .. "/bluetooth.lua")
     if not loader then
@@ -90,7 +88,7 @@ function BluetoothController:loadSettings()
     return self:applyConfig(file_config)
 end
 
--- 唯一的校验点：全部字段必填，一项不过关就整份拒绝（docs §10、§9）
+-- 唯一的校验点：全部必填，一项不过关整份拒绝，不加兜底（docs §10）
 function BluetoothController:applyConfig(cfg)
     local checks = {
         { "device_path",         isDevicePath(cfg.device_path) },
@@ -108,7 +106,6 @@ function BluetoothController:applyConfig(cfg)
         end
     end
 
-    -- 每个映射到的轴都必须有中心值，否则 parseAnalogInput 会拿到 nil
     for code in pairs(cfg.analog_map) do
         if not isNumberInRange(cfg.analog_center[code], 0, 65535) then
             logger.warn("BT Plugin: Missing analog_center for axis " .. tostring(code))
@@ -116,12 +113,11 @@ function BluetoothController:applyConfig(cfg)
         end
     end
 
-    -- 整表拷贝而非逐字段枚举（docs §9），再覆盖唯一那项
     self.config = {}
     for k, v in pairs(cfg) do
         self.config[k] = v
     end
-    -- 覆盖值 > bluetooth.lua，无第三层兜底；判 nil 而非 `or` 的理由见 docs §10
+    -- 必须判 nil：用 `or` 会把 false 覆盖值吃掉（docs §10）
     local saved = self.settings:readSetting("invert_layout")
     if saved == nil then saved = cfg.invert_layout end
     self.config.invert_layout = saved == true
@@ -141,7 +137,7 @@ function BluetoothController:registerInputHook()
     _shared_hook_registered = true
 end
 
--- 切换 input_no_key_repeat 会清空整条 hook 链，下一个 tick 把自己挂回去（docs §5）
+-- 切换 input_no_key_repeat 会清空整条 hook 链（docs §5）
 function BluetoothController:onToggleKeyRepeat()
     UIManager:nextTick(function()
         if _current_active_controller == self
@@ -168,7 +164,6 @@ local function getFBInkInput()
         return nil
     end
     _fbink_input = library
-    -- 掩码与 SCAN_ONLY 的理由见 docs §1
     _fbink_input_masks = {
         match = bit.bor(C.INPUT_JOYSTICK, C.INPUT_DPAD),
         exclude = C.INPUT_TOUCHSCREEN,
@@ -206,7 +201,6 @@ function BluetoothController:openDevice(is_reload)
 
     local usable = isControllerDevice(path)
 
-    -- 关闭顺序的权衡见 docs §9
     if self:isDeviceOpened(path) and (is_reload or not usable)
         and not self:closeDevice(path) then
         return false
@@ -284,13 +278,11 @@ function BluetoothController:scanJoystickDevices()
     return devices
 end
 
--- khp 守护进程：只需要「在 / 不在」两态，用信号起停就够了（docs §12）
 function BluetoothController:isDaemonRunning()
     return os.execute("pgrep -f " .. self._daemon_pattern .. " >/dev/null 2>&1") == 0
 end
 
 function BluetoothController:startDaemon()
-    -- khp/ 被 gitignore，二进制缺失是最可能的实际场景（docs §9）
     if lfs.attributes(self._daemon_binary, "mode") ~= "file" then
         logger.warn("BT Plugin: khp binary missing at " .. self._daemon_binary)
         return false
@@ -303,7 +295,6 @@ function BluetoothController:startDaemon()
 end
 
 function BluetoothController:stopDaemon()
-    -- SIGTERM，与 khp 自带 daemon.sh 的 stop() 一致
     os.execute("pkill -f " .. self._daemon_pattern)
     logger.info("BT Plugin: khp daemon stop requested")
 end
@@ -319,7 +310,6 @@ local function fetchBatteryLevel(device_path)
 
     for _i, conn in ipairs(require("rapidjson").decode(body).connections) do
         for _j, path in ipairs(conn.input_paths) do
-            -- 按节点匹配而非 MAC：device_path 是插件唯一认的身份（docs §9）
             if path == device_path then
                 -- JSON null 被解成 rapidjson.null（userdata），不是 nil
                 return type(conn.battery_level) == "number" and conn.battery_level
@@ -329,7 +319,6 @@ local function fetchBatteryLevel(device_path)
 end
 
 function BluetoothController:readBatteryLevel()
-    -- pgrep 比 fork 一个 wget 便宜得多，守护进程不在就别费劲
     if not self:isDaemonRunning() then return nil end
 
     local ok, level = pcall(fetchBatteryLevel, self.config.device_path)
@@ -337,7 +326,6 @@ function BluetoothController:readBatteryLevel()
     logger.dbg("BT Plugin: battery read failed: " .. tostring(level))
 end
 
--- 起停不同步，故延时回查（docs §12）
 function BluetoothController:_daemonCheck()
     UIManager:show(InfoMessage:new{
         text = self:isDaemonRunning() and _("守护进程已启动") or _("守护进程已停止"),
@@ -352,7 +340,6 @@ function BluetoothController:_reconnect()
     end
 end
 
--- 掉线与重连全靠这两个事件，没有唤醒定时重连（docs §2、§3）
 function BluetoothController:onEvdevInputInsert(path)
     if path ~= self.config.device_path then return end
     logger.info("BT Plugin: Input device inserted: " .. path)
@@ -376,7 +363,6 @@ function BluetoothController:pokeActivity()
 end
 
 function BluetoothController:handleInputEvent(ev)
-    -- 只认手柄那一个 fd（docs §9）
     if not self.opened_fd or ev.fd ~= self.opened_fd then return end
 
     local direction = self:parseInputDirection(ev)
@@ -396,7 +382,6 @@ function BluetoothController:parseInputDirection(ev)
         return self.config.key_map[ev.code]
     end
 
-    -- 本手柄只有摇杆，没有十字键，所以 EV_ABS 只有一条路（docs §11）
     if ev.type == C.EV_ABS then return self:parseAnalogInput(ev) end
 
     return nil
@@ -411,7 +396,7 @@ function BluetoothController:parseAnalogInput(ev)
     local threshold = self.config.axis_threshold
     local deviation = math.abs(ev.value - center)
 
-    -- 表当集合用：全部映射轴都回中（集合空）才解锁，否则一次推杆会连翻（docs §4）
+    -- 表当集合用：集合空（全轴回中）才解锁，否则一次推杆会连翻（docs §4）
     if deviation <= threshold then
         _deflected_axes[ev.code] = nil
         if next(_deflected_axes) == nil then _shared_triggered = false end
@@ -484,7 +469,6 @@ function BluetoothController:addToMainMenu(menu_items)
                 timeout = 2,
             })
 
-            -- 不主动重开设备，那条路由 onEvdevInputInsert 兜住（docs §12）
             UIManager:unschedule(self._daemonCheck)
             UIManager:scheduleIn(starting and DAEMON_START_DELAY or 1, self._daemonCheck, self)
         end,
@@ -506,9 +490,7 @@ function BluetoothController:addToMainMenu(menu_items)
             for _i, dev in ipairs(devices) do
                 local is_configured = dev.path == self.config.device_path
                 local tag = DEVICE_TAGS[is_configured][dev.opened]
-                -- 只替本机配置那一台的名字；其余保留 evdev 原名，方便认节点
                 local name = is_configured and self.config.display_name or dev.name
-                -- 只为配置那一台读电量：一次菜单打开最多一个 HTTP 请求
                 local level = is_configured and self:readBatteryLevel()
                 local pct = level and string.format(" %d%%", level) or ""
                 table.insert(items, { text = name .. pct .. tag })
@@ -523,7 +505,6 @@ function BluetoothController:addToMainMenu(menu_items)
         callback = function()
             self.config.invert_layout = not self.config.invert_layout
             self.settings:saveSetting("invert_layout", self.config.invert_layout)
-            -- flush 自带原子写 + .old 备份 + fsync（luasettings.lua:270）
             self.settings:flush()
         end
     })

@@ -14,10 +14,14 @@
 > | 手柄 | Xbox Wireless Controller（经典蓝牙） | 黑鲨双翼手柄L（BLE） |
 > | 蓝牙栈 | Amazon 原生（`ace_bt_cli` / `lipc com.lab126.btfd`） | kindle-hid-passthrough（用户态 Bumble） |
 > | 轴量纲 | 0–65535，中心 32768 | **8 位有符号，中心 0，±127** |
-> | 节点 | `/dev/input/event6` | `/dev/input/event3` |
+> | 节点 | `/dev/input/event6` | `/dev/input/event2`（会漂移，见 §11） |
 >
 > 两条链路的终点相同 —— 都是 `/dev/uhid` → evdev，所以插件消费输入的那部分代码
 > 两边完全一致。差别只在**谁负责把 BLE 链路建起来**，见 §11。
+>
+> ⚠️ **两份 `bluetooth.lua` 的数值不能互抄。** 轴量纲差 256 倍：把主分支的
+> `axis_threshold = 16384` 抄到本分支，摇杆永远推不过阈值（极值只有 ±127）；
+> 反向抄则是碰一下就翻页。`analog_center` 同理。
 
 验证环境：KOReader **v2026.07.2**。
 
