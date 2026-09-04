@@ -774,13 +774,13 @@ pkill -f ld-linux-armhf                          # 停
 
 | 项 | 实测值 | 出处 |
 | --- | --- | --- |
-| 常驻内存 | **RSS 33060 KB ≈ 32.3 MB**（VSZ 37728 KB，CPU 2.4%，总内存 956 MB） | `ps aux` |
-| 轴量纲 | **8 位有符号，中心 0，极值 ±127** | `event3` 原始字节，见下 |
+| 常驻内存 | **Pss 32.0 MB / RSS 32.2 MB**，三次测量 32.0/32.2/32.3，稳定无泄漏 | 见下「内存占用与 OOM 顺序」 |
+| 轴量纲 | **8 位有符号，中心 0，极值 ±127** | 原始字节，见下 |
 | 按键码（**声明**） | 304 305 307 308 310 311 312 313 314 315 317 318 | `B: KEY` 位图解码 |
 | 按键码（**实发**） | 304 305 307 308 310 **312** | 逐个实按 |
 | 方向键 | **不存在**（物理上没有十字键） | 只按方向键时收不到 `code=16/17` |
 
-「Bumble 太重」这个判断被 32 MB / 3.3% 推翻了 —— 和当年「菜单卡顿」量出
+「Bumble 太重」这个判断被 32 MB 推翻了 —— 和当年「菜单卡顿」量出
 `fbink_input_scan` 只花 2.2ms 是同一类：先量，再判。
 
 **轴量纲的解码过程**（32 位 ARM 的 `input_event` = `tv_sec`+`tv_usec`+`type`+`code`+`value`，共 16 字节）：
@@ -800,6 +800,88 @@ B: KEY=6fdb0000 0 0 0 1000 40000800 c0000 0 0 0
 0x6fdb0000 → 组内 bit 16,17,19,20,22,23,24,25,26,27,29,30
            → +288 = 304,305,307,308,310,311,312,313,314,315,317,318
 ```
+
+### 内存占用与 OOM 顺序：结论是不优化
+
+**结论先写：什么都不做。** 下面是依据，免得「khp 是不是太重」这个念头再冒
+出来时把整轮重新量一遍。
+
+#### 怎么量
+
+进程在 `ps` 里叫 `ld-linux-armhf.`（自带加载器，内核只留 15 字符），
+**按进程名搜不到**，必须按命令行里的路径片段找 —— 和 `isDaemonRunning`
+用的是同一个依据：
+
+```sh
+p=$(pgrep -f khp/dist/main.bin)
+
+# RSS
+awk '/^VmRSS/{print $2" kB"}' /proc/$p/status
+
+# Pss（真正独占，共享库按比例摊）。本机没有 smaps_rollup，自己汇总
+awk '/^Pss:/{s+=$2} END{printf "Pss=%d kB (%.1f MB)\n", s, s/1024}' /proc/$p/smaps
+
+# 按映射拆，看钱花在哪
+awk '/^[0-9a-f]+-[0-9a-f]+ /{n=(NF>=6?$6:"[anon]")} /^Pss:/{s[n]+=$2} \
+     END{for(k in s) printf "%8d kB  %s\n", s[k], k}' /proc/$p/smaps | sort -rn | head -15
+```
+
+> `/proc/PID/smaps_rollup` 在这台机器上**不存在**，但 `/proc/PID/smaps`
+> 存在。所以 Pss 拿得到，只是没有汇总快捷方式。别因为 rollup 缺失就断定
+> 内核关了 `CONFIG_PROC_PAGE_MONITOR` —— 那是错的，我错过一次。
+
+#### 成分（Pss 32812 kB 实测）
+
+| 类别 | Pss | 性质 |
+| --- | --- | --- |
+| `[anon]` 14536 + `[heap]` 2992 | **17.1 MB** | Python 堆：对象、字典、bytecode。**真正占住**，本机无交换分区 |
+| `main.bin` 9824 + `libpython3.11.so` 3076 + `libc.so.6` 976 + 零碎 | **14.4 MB** | 文件页，干净可回收。内存紧张时内核直接丢掉，从 `/mnt/us` 重读 |
+| `[stack]` 100 + 尾部 | ~0.7 MB | |
+
+**压力下的真实成本是 17 MB，不是 32 MB。** 而这 17 MB 全是 Python 运行时
+数据 —— 恰好是 Bumble 调不动的部分。
+
+#### 为什么 Bumble 调优不值得
+
+| 手段 | 预期 | 为什么不做 |
+| --- | --- | --- |
+| Bumble 自身参数 | ~0 | 纯 Python 协议栈，内存是对象和已导入模块，没有 MB 级的缓冲区旋钮 |
+| `MALLOC_ARENA_MAX=1` | **< 1 MB** | 只作用于 glibc arena，而 `[heap]` 仅 2.9 MB；大头 `[anon]` 是 pymalloc 自己 mmap 的，管不到。**我一度估成 1–3 MB，是错的** |
+| `PYTHONOPTIMIZE=2` | 1–2 MB | 要重新打包 |
+| 裁 `cryptography` 后端 | 5–10 MB | 要重新打包，且 SMP 依赖它，**极易搞坏 BLE 配对** |
+| 不用 Python | 大头 | 不可行，理由见本节前面「为什么必须靠外部守护进程」 |
+
+#### OOM：khp 排在 KOReader 之后，不需要保护
+
+`free -m` 实测 `available 543 / total 970 MB`（56% 可用），**没有内存压力**。
+
+`oom_score` 是 501，比按占用推算的 30–40 高一个数量级。我据此猜「`oom_score_adj`
+被设成了大正数，khp 会优先被杀」—— **猜错了**。实测 `adj = 470`，而 470 是这台
+机器上「普通应用」的环境默认值，khp 只是继承了父进程的值：
+
+```
+647  658  fastmetrics      ← Amazon 后台守护进程，被刻意设成「优先牺牲」档
+647  653  appmgrd
+647  652  contentpackd
+647  651  dpmd / demd
+649       dynconfig
+470  588  java             ← Amazon 框架
+470  516  reader.lua       ← KOReader 自己
+470  501  ld-linux-armhf.  ← khp，第 9 位
+470  471  koreader.sh / dropbear / sh
+```
+
+复现：
+
+```sh
+for d in /proc/[0-9]*; do
+    [ -r $d/oom_score_adj ] && echo "$(cat $d/oom_score_adj)  $(cat $d/oom_score)  $(cat $d/comm)"
+done 2>/dev/null | sort -rn | head -20
+```
+
+**所以「往 `/proc/<pid>/oom_score_adj` 写个小值来保护 khp」这个改动刻意不做。**
+OOM killer 要轮到 khp，前面 6 个 Amazon 守护进程、java 框架（588）和 KOReader
+本身（516）都已经死了 —— 翻页功能已经不存在，救 khp 没有任何意义。
 
 ### ⚠️ 位图只能用来排除，不能用来确认
 
