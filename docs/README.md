@@ -27,7 +27,8 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| `device_path` | 手柄对应的 Linux 输入节点，例如 `/dev/input/event3`。 |
+| `device_path` | 手柄对应的 Linux 输入节点，例如 `/dev/input/event2`。 |
+| `display_name` | 「已连接设备」菜单里显示的名字，非空字符串。**只替换本机配置那一台**；扫到的其他节点仍显示 evdev 原名，方便认节点。原名带 khp 生成的 MAC 后缀，很长。 |
 | `trigger_cooldown_ms` | 两次翻页触发之间的最小间隔，单位为毫秒（0~60000）。 |
 | `invert_layout` | 是否反转上一页/下一页方向。**本分支唯一可被菜单覆盖的项**。 |
 | `axis_threshold` | 模拟轴死区阈值（0~65535）。本分支为 `95`（行程 ±127）。 |

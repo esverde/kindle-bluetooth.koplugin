@@ -94,6 +94,7 @@ end
 function BluetoothController:applyConfig(cfg)
     local checks = {
         { "device_path",         isDevicePath(cfg.device_path) },
+        { "display_name",        type(cfg.display_name) == "string" and cfg.display_name ~= "" },
         { "trigger_cooldown_ms", isNumberInRange(cfg.trigger_cooldown_ms, 0, 60000) },
         { "axis_threshold",      isNumberInRange(cfg.axis_threshold, 0, 65535) },
         { "key_map",             type(cfg.key_map) == "table" },
@@ -474,8 +475,11 @@ function BluetoothController:addToMainMenu(menu_items)
 
             local items = {}
             for _i, dev in ipairs(devices) do
-                local tag = DEVICE_TAGS[dev.path == self.config.device_path][dev.opened]
-                table.insert(items, { text = dev.name .. tag })
+                local is_configured = dev.path == self.config.device_path
+                local tag = DEVICE_TAGS[is_configured][dev.opened]
+                -- 只替本机配置那一台的名字；其余保留 evdev 原名，方便认节点
+                local name = is_configured and self.config.display_name or dev.name
+                table.insert(items, { text = name .. tag })
             end
             return items
         end,

@@ -6,6 +6,8 @@
 
 return {
     device_path = "/dev/input/event2",
+    -- 「已连接设备」里显示的名字。evdev 原名带 khp 生成的 MAC 后缀，太长
+    display_name = "黑鲨双翼手柄L",
     trigger_cooldown_ms = 500,
 
     invert_layout = false,    -- [可覆盖] 反转方向
