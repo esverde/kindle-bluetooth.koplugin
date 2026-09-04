@@ -1101,15 +1101,82 @@ BT 芯片，而那段代码是整个项目最脆弱的部分，为一个边缘�
 停守护进程也救不回来。
 
 **冲突只发生在 WiFi 状态转换的瞬间** —— khp 攥着芯片时去 cycle 它才会炸。
-所以规避有两条路，第二条更省事：
+**稳定共存是正常的**（证据见下）。所以只需记住一条：
 
-1. **每次动 WiFi 前先停守护进程**：菜单关掉「蓝牙守护进程」→ 等提示「守护进程
-   已停止」→ 开 WiFi 用完 → 再起守护进程。
-2. **先把 WiFi 连好，再起守护进程**（推荐）。整个阅读期间不发生 WiFi 状态转换，
-   就不触发冲突。
+> **先把 WiFi 连好，再起守护进程；读书期间不动 WiFi。**
 
-> 第 2 条是从 #88 的机制推出来的，**尚未在真机验证**。验法：WiFi 连好 → 起
-> 守护进程 → 确认手柄能翻页且 WiFi 仍在线。
+真要中途开关 WiFi，就先在菜单里关掉「蓝牙守护进程」，等提示「守护进程已停止」
+之后再动。
+
+#### 「稳定共存没问题」的三条证据
+
+结论不是推测，也不用自己搭测试：
+
+1. **#88 报告人自己就是这么用的。** 原话：「Kindle-hid-passthrough **works well
+   on my device**. It's just that every time after I turn off wifi while
+   bluetooth is on…」—— 他用 AI 翻译插件，需要反复开关 WiFi，坏的只是**切换那
+   一下**。他还明确说规避要在 "enabling **or** disabling wifi" 之前关蓝牙：
+   **两个方向都算**，不只是关。
+2. **khp 自己的装机流程就要求 WiFi 开着。** 配对与调试步骤依赖 SSH 登录设备。
+   若两者互斥，上游文档根本写不出来。README 里唯一记载的冲突是**与 Amazon 自己
+   的蓝牙栈**（占用期间不能听有声书），**不是 WiFi**。
+3. **驱动层机制说得通**（下一节）。
+
+#### 机制：`wmt_drv` 对共享芯片做引用计数
+
+从上游 #179 与 #254 的内核信息拼出来的模块关系：
+
+```
+wmt_drv（MediaTek Wireless Management Task，管这颗组合芯片）
+ ├─ wmt_cdev_bt      → /dev/stpbt   ← khp 抢的是这一半
+ └─ wmt_chrdev_wifi  → wlan0
+```
+
+`wmt_drv` 按引用计数决定芯片供电。**稳定态下 WiFi 与 BT 各持一份，互不干扰**；
+炸只发生在「一方释放、而另一方的持有者不被 Amazon 的栈感知」的瞬间。
+
+#179 给了直接证据：
+
+> closing `/dev/stpbt` **drops the power to the MTK chip** via the
+> `wmt_cdev_bt` module, wiping its firmware
+
+即**开关**会动整颗芯片，而**保持不动不会**。这同时解释了两个现象：
+
+| 现象 | 原因 |
+| --- | --- |
+| Scribe 上关 WiFi 会连带关掉经典蓝牙 | 两半都归 Amazon，它知道 BT 也挂在这颗芯片上，于是有序地一起关。**这是正确行为，不是 bug** |
+| PW6 + khp 上 cycle WiFi 会卡死 | khp 攥着 BT 那半，Amazon 的栈不知道还有人持有，照旧去 cycle → 引用计数与真实持有者不一致 |
+
+两者是同一枚硬币，差别**只在于谁拥有芯片**。
+
+#### 刻意不做：用 KOReader 的网络事件自动避让
+
+KOReader 确实提供了前置钩子，`manager.lua:73` 的注释明确说是给插件用的：
+
+```
+manager.lua:74   broadcastEvent(Event:new("NetworkConnecting"))
+manager.lua:77   return self:turnOnWifi(...)            ← 实际动作在广播之后
+manager.lua:413  broadcastEvent(Event:new("NetworkDisconnecting"))
+manager.lua:425  self:turnOffWifi(complete_callback)    ← 同样在广播之后
+```
+
+所以技术上可以在这两个事件里先停守护进程，约 15 行。**不做**，三个理由：
+
+1. **没有静默切换需要防。** `wifi_enable_action` 默认走 `promptWifiOn()`
+   （`manager.lua:605-616`），KOReader 开 WiFi 前会弹窗；`auto_restore_wifi`
+   与 `auto_disable_wifi` 默认关闭。**每次 WiFi 切换都是用户的有意识动作**，
+   所以不存在「翻页神秘失灵」的场景。
+2. **它覆盖不了 Kindle 原生界面。** 从 Amazon 自己的设置里关 WiFi，KOReader
+   收不到任何事件。而**部分机制防护会侵蚀那条真正有效的纪律** —— 装了之后容易
+   误以为「随便关 WiFi 没事了」，然后在原生界面上踩一次。
+3. **工作流方案是 0 行且覆盖全部路径。** 上面那一句话就够了。
+
+真正该修的地方在 khp 里（让守护进程监听 WiFi 状态并动态重新初始化芯片），
+上游作者已明确拒绝，理由是那段是项目最脆弱的代码。**不要等上游。**
+
+> 唯一没有证据覆盖的是**睡眠唤醒**：没有 issue 提到，机制上也推不出来（取决于
+> Amazon 的 suspend/resume 会不会重新 associate WiFi）。不必专门测 —— 正常用
+> 几天没再卡死就是过了。
 
 #### KOReader 那两个自动开关 WiFi 的设置：默认就是关的
 
