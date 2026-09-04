@@ -34,14 +34,14 @@ local _shared_last_trigger_time
 local _shared_last_power_reset_time
 local _shared_hook_registered = false
 local _shared_triggered = false
-local _shared_axis_values = {}
+local _deflected_axes = {}
 local _current_active_controller
 local _fbink_input
 local _fbink_input_masks
 local _fbink_input_checked = false
 
 local function resetInputState()
-    _shared_axis_values = {}
+    _deflected_axes = {}
     _shared_triggered = false
 end
 
@@ -354,9 +354,8 @@ function BluetoothController:handleInputEvent(ev)
 
     self:pokeActivity()
 
-    if self.config.invert_layout then direction = -direction end
-
-    UIManager:sendEvent(Event:new("GotoViewRel", direction))
+    UIManager:sendEvent(Event:new("GotoViewRel",
+        self.config.invert_layout and -direction or direction))
     ev.type = -1
 end
 
@@ -382,16 +381,13 @@ function BluetoothController:parseAnalogInput(ev)
     local threshold = self.config.axis_threshold
     local deviation = math.abs(ev.value - center)
 
-    _shared_axis_values[ev.code] = deviation
-
-    -- 全部映射轴都回中才解锁，否则一次推杆会连翻（docs §4）
+    -- 表当集合用：全部映射轴都回中（集合空）才解锁，否则一次推杆会连翻（docs §4）
     if deviation <= threshold then
-        for _axis, axis_deviation in pairs(_shared_axis_values) do
-            if axis_deviation > threshold then return nil end
-        end
-        _shared_triggered = false
+        _deflected_axes[ev.code] = nil
+        if next(_deflected_axes) == nil then _shared_triggered = false end
         return nil
     end
+    _deflected_axes[ev.code] = true
 
     if _shared_triggered then return nil end
 

@@ -5,7 +5,7 @@
 -- 无摇杆/方向键模式切换 —— 这个手柄没有十字键（docs §11）。
 
 return {
-    device_path = "/dev/input/event3",
+    device_path = "/dev/input/event2",
     trigger_cooldown_ms = 500,
 
     invert_layout = false,    -- [可覆盖] 反转方向
@@ -15,13 +15,14 @@ return {
     analog_center = { [0] = 0, [1] = 0 },
 
     -- 只映射实按验证过的键；为什么不能照 B: KEY 位图映射见 docs §11
+    -- 方向值直接进 GotoViewRel：1 = 下一页，-1 = 上一页
     key_map = {
-        [304] = -1, [307] = -1, [310] = -1,   -- A / X / L1 上一页
-        [305] = 1,  [308] = 1,  [312] = 1,    -- B / Y / L2 下一页
+        [304] = 1,  [305] = 1,  [310] = 1,    -- A / B / L1 下一页
+        [307] = -1, [308] = -1, [312] = -1,   -- X / Y / L2 上一页
     },
 
     analog_map = {
-        [1] = { low_dir = 1, high_dir = -1 }, -- ABS_Y
+        [1] = { low_dir = -1, high_dir = 1 }, -- ABS_Y
         [0] = { low_dir = -1, high_dir = 1 }  -- ABS_X
     },
 }
