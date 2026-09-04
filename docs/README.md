@@ -994,6 +994,57 @@ util.shell_escape({ self.path .. "/khp/dist/main.bin" })
 `self.path` 在 `init` 里固定，所以 `_daemon_binary` 和 `_daemon_pattern`
 （含 `shell_escape`）都在那里算一次，不用每次重新拼。
 
+### ⚠️ 守护进程运行期间不要开关 WiFi —— 会把射频卡死到重启
+
+**这不是本插件的缺陷，也修不了。** 上游 issue
+[#88](https://github.com/zampierilucas/kindle-hid-passthrough/issues/88)
+（截至 2026-09 仍 open），作者 `zampierilucas` 本人的诊断：
+
+> wifi and bluetooth share the same combo chip on the kindle, and this project
+> takes the bt half over completely to bypass the stock stack. it doesnt
+> coexist with wifi the way the stock driver expects, so toggling wifi off and
+> on tries to cycle the shared chip while we're still holding it, and **it
+> wedges til a reboot**.
+
+机制：PW6 的 WiFi 与蓝牙是同一颗组合芯片（`/dev/stpbt` 是 MediaTek 的 BT
+字符设备，见 §11「目标机器」）。khp 绕过 Amazon 的 Bluedroid，把 BT 那半
+**完全独占**。WiFi 开关会尝试 cycle 整颗芯片，而 khp 还攥着它。
+
+作者已明确表示不会修，理由是修法要让守护进程监听 WiFi 状态并动态重新初始化
+BT 芯片，而那段代码是整个项目最脆弱的部分，为一个边缘场景改它会危及所有人的
+重连。**所以这是长期约束，不要等上游。**
+
+**症状**：WiFi 搜不到网络、连不上。**恢复**：只能重启 Kindle —— 一旦卡住，
+停守护进程也救不回来。
+
+**规避（顺序问题）**：
+
+1. 菜单里关掉「蓝牙守护进程」，等到提示「守护进程已停止」；
+2. 开 WiFi，连好，用完；
+3. 再把守护进程起回来。
+
+#### 真正危险的是 KOReader 自己会偷偷开关 WiFi
+
+比手动切换更容易踩的是这两个设置，它们会在你不碰任何东西的时候 cycle 射频。
+用守护进程期间**两个都应该关掉**：
+
+| KOReader 设置项（网络菜单） | 内部键 | 为什么危险 |
+|---|---|---|
+| Restore Wi-Fi connection on resume | `auto_restore_wifi` | 帮助文字原文是「automatically and **silently** re-connect to Wi-Fi on startup or on resume」。带手柄看书时唤醒极其频繁，等于随机时刻 cycle 射频（`manager.lua:984-993`） |
+| Disable Wi-Fi connection when inactive | `auto_disable_wifi` | 空闲一段时间后自动关 WiFi（`networklistener.lua:85-185`）。KOReader 自己的帮助文字就说这项在原生 Kindle 上「unlikely to function properly」 |
+
+查当前值：
+
+```sh
+grep -E 'auto_(restore|disable)_wifi' /mnt/us/koreader/settings.reader.lua
+```
+
+#### 顺带排除的一个误判方向
+
+这与 §11 里那个 `media_remote=false` 无关。那一项关的是 khp 自己的经典蓝牙
+页面扫描，属于 khp 内部行为；本条冲突发生在**芯片层**，khp 只要在跑就成立，
+和 khp 的任何配置项都无关。
+
 ---
 
 # 验证方法
