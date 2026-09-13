@@ -362,7 +362,7 @@ tail -40 /mnt/us/koreader/plugins/bluetooth.koplugin/khp/hid_passthrough.log
 | `main` | 当前分支。经 kindle-hid-passthrough 支持 BLE 手柄,持续维护。 |
 | `classic` | 早期实现,用 Kindle 自带蓝牙栈支持经典蓝牙手柄。已归档,不再更新。 |
 
-`docs/README.md` 是维护者笔记:实测得到的事实、被否掉的方案,以及那些不显然的
+`docs/NOTES.md` 是维护者笔记:实测得到的事实、被否掉的方案,以及那些不显然的
 代码背后的理由。它是工作记录,不是使用说明。
 
 ## 致谢

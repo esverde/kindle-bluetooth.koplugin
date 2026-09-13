@@ -475,7 +475,7 @@ function BluetoothController:addToMainMenu(menu_items)
             local starting = not self:isDaemonRunning()
             if starting and not self:startDaemon() then
                 UIManager:show(InfoMessage:new{
-                    text = _("找不到守护进程，见 docs §12"), timeout = 3 })
+                    text = _("找不到守护进程，请检查插件目录下的 khp/"), timeout = 3 })
                 return
             end
             if not starting then self:stopDaemon() end

@@ -293,7 +293,7 @@ khp 独占 `/dev/stpbt` 直驱蓝牙硬件（绕开内核 BT 子系统，见 §1
 getting stuck on or off"*）。
 
 所以本分支没有 `getRealState` / `setBluetoothState` / 「蓝牙开关」菜单项。
-那套 lipc 代码与其全部实测事实仍在**主分支的 `docs/README.md` §6**，
+那套 lipc 代码与其全部实测事实仍在**`classic` 分支的 `docs/README.md` §6**，
 要重新引入之前先读那一节。
 
 ## §7 KOReader API 用法

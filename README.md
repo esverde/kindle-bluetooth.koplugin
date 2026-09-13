@@ -390,7 +390,7 @@ tail -40 /mnt/us/koreader/plugins/bluetooth.koplugin/khp/hid_passthrough.log
 | `main` | This one. BLE controllers via kindle-hid-passthrough. Actively maintained. |
 | `classic` | Earlier implementation for classic-Bluetooth controllers using the Kindle's own Bluetooth stack. Archived, no longer updated. |
 
-`docs/README.md` holds maintainer notes: measured facts, rejected designs and
+`docs/NOTES.md` holds maintainer notes: measured facts, rejected designs and
 the reasoning behind non-obvious code. It is a working log, not documentation.
 
 ## Credits

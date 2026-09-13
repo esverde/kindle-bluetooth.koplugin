@@ -1,69 +1,30 @@
-config/
-data/
-export/
-import/
-info/
-test/
-log/
+# kindle-hid-passthrough 守护进程（约 18.7M 三方二进制）。
+# 刻意不进仓库：git 历史是永久成本，且上游在活跃修变砖级 bug，
+# 钉死版本会让修复静默到不了手上。安装步骤见 README。
+khp/
+
+# 本地参考用的 KOReader 克隆，不是本项目的一部分
 koreader/
 koreader-base/
 
-# kindle-hid-passthrough 守护进程（约 18.7M 三方二进制）。
-# 刻意不进仓库：git 历史是永久成本，且上游在活跃修变砖级 bug，
-# 钉死版本会让修复静默到不了手上。版本与安装步骤见 docs §11。
-khp/
-
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-.Python
-env/
-build/
-dist/
+# 日志与临时产物
 *.log
+log/
+test/
 
-# pyenv
-.python-version
-
-# dotenv
-.env
-
-# virtualenv
-.venv/
-venv/
-ENV/
-
-# VSCode settings
-.vscode
-
-# IDEA files
-.idea
-
-# OSX dir files
+# 编辑器与系统垃圾
+.vscode/
+.idea/
 .DS_Store
-
-# Sublime Text settings
 *.sublime-workspace
 *.sublime-project
 
-# AI Client
-GEMINI.md
-AGENTS.md
+# AI 客户端
 CLAUDE.md
+AGENTS.md
+GEMINI.md
 .claude/
 .gemini/
 .qwen/
 .openai/
-
-# Files
-*.xlsx
-
-# Prefect Deployment
-prefect.yaml
-.prefectignore
-
-.build_docker
 .codegraph/
