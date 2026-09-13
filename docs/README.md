@@ -6,22 +6,22 @@
 改动这个插件之前先读「已核验事实」一节 —— 里面每一条都是踩坑或翻源码换来的，
 其中若干条曾经被"看起来更合理"的直觉推翻过，然后又被证据推翻回来。
 
-> **本分支（BLE）与主分支（经典蓝牙）目标机型不同，配置不可互换。**
+> **这是维护者笔记，不是使用说明。** 面向用户的文档见仓库根目录的
+> `README.md`（英文）/ `README.zh-CN.md`（中文）。这里只记实现过程中查证过的
+> 事实与被否掉的方案，避免重复踩坑。
 >
-> | | 主分支 `main` | 本分支 |
+> | | `main`（本分支） | `classic` 分支 |
 > | --- | --- | --- |
-> | 机型 | Kindle Scribe | Kindle PW6（Paperwhite 12 代，`0xC7E`） |
-> | 手柄 | Xbox Wireless Controller（经典蓝牙） | 黑鲨双翼手柄L（BLE） |
-> | 蓝牙栈 | Amazon 原生（`ace_bt_cli` / `lipc com.lab126.btfd`） | kindle-hid-passthrough（用户态 Bumble） |
-> | 轴量纲 | 0–65535，中心 32768 | **8 位有符号，中心 0，±127** |
-> | 节点 | `/dev/input/event6` | `/dev/input/event2`（会漂移，见 §11） |
+> | 链路 | BLE，经 kindle-hid-passthrough（用户态 Bumble） | 经典蓝牙，Amazon 原生栈（`lipc com.lab126.btfd`） |
+> | 实测机型 | Scribe、Paperwhite 12 代、Kindle(2024) | 仅 Scribe |
+> | 状态 | 在维护 | 归档，不再更新 |
 >
 > 两条链路的终点相同 —— 都是 `/dev/uhid` → evdev，所以插件消费输入的那部分代码
-> 两边完全一致。差别只在**谁负责把 BLE 链路建起来**，见 §11。
+> 两边基本一致。差别只在**谁负责把链路建起来**，见 §11。
 >
-> ⚠️ **两份 `bluetooth.lua` 的数值不能互抄。** 轴量纲差 256 倍：把主分支的
-> `axis_threshold = 16384` 抄到本分支，摇杆永远推不过阈值（极值只有 ±127）；
-> 反向抄则是碰一下就翻页。`analog_center` 同理。
+> ⚠️ **两个分支的 `bluetooth.lua` 数值不能互抄。** 轴量纲可能差 256 倍：16 位手柄
+> 是 0–65535 / 中心 32768，8 位手柄是 ±127 / 中心 0。抄错的症状是「推不动」或
+> 「碰一下就翻页」。换手柄一律重新实测，方法见 §11「实测数值」。
 
 验证环境：KOReader **v2026.07.2**。
 
@@ -59,7 +59,7 @@
 
 ```sh
 grep "Found input device" /mnt/us/koreader/crash.log
-# BT Plugin: Found input device: 黑鲨双翼手柄L-BF5B at /dev/input/event3 (opened=true)
+# BT Plugin: Found input device: 黑鲨双翼手柄L-XXXX at /dev/input/event3 (opened=true)
 ```
 
 **`bluetooth.lua` 是只读的**，插件永不改写它，注释和格式随你怎么写。
@@ -117,7 +117,7 @@ khp 守护进程运行、手柄已连）：
 [FBInk] /dev/input/event0: `bd71828-pwrkey`     = KEY | POWER_BUTTON
 [FBInk] /dev/input/event1: `pt_mt`              = TOUCHSCREEN
 [FBInk] /dev/input/event2: `gesture_tap`        = KEY | KINDLE_FRAME_TAP
-[FBInk] /dev/input/event3: `黑鲨双翼手柄L-BF5B`  = JOYSTICK | KEY | MENU_BUTTON | VOLUME_BUTTONS
+[FBInk] /dev/input/event3: `黑鲨双翼手柄L-XXXX`  = JOYSTICK | KEY | MENU_BUTTON | VOLUME_BUTTONS
 ```
 
 只有 event3 带 `JOYSTICK`，`match = JOYSTICK|DPAD` 这一关就把其余三个全挡住了。
@@ -449,20 +449,21 @@ end
 
 ### 目标机器
 
-`kindle-hid-passthrough --diagnostics` 实测（这个子命令是只读的，排错先跑它）：
+BLE 链路已在 **Kindle Scribe、Paperwhite 12 代、Kindle(2024, Basic 5)** 三台上
+实测可用。经典蓝牙那套（`classic` 分支）只在 Scribe 上测过。
+
+共同点（`kindle-hid-passthrough --diagnostics` 实测，这个子命令只读，排错先跑它）：
 
 | 项 | 值 |
 | --- | --- |
-| 型号 | Kindle PW6（device code `0xC7E`） |
-| 内核 | `5.15.41-lab126` |
-| 固件 | `042-juno_1906_sangria_bellatrix4-483216` |
 | 传输 | `file:/dev/stpbt`，`chip backend: MtkChip` |
 | `/dev/stpbt` | `crw-rw---- root bluetoot 192,0` |
 | `/dev/uhid` | 存在；`/sys/bus/hid` 存在 |
 | 已加载模块 | `wmt_cdev_bt`、`wmt_drv`（联发科 CONSYS，**不是** Linux BT 子系统） |
 
-> khp 的 README 说 MediaTek 11 代是 `4.9.77-lab126` —— PW6 是 12 代，实测
-> `5.15.41`。别照抄 README 里的内核号。
+> **内核版本因机型而异**，`4.9.77-lab126` 与 `5.15.41-lab126` 都见过。任何以内核号
+> 为前提的判断都要在目标机上用 `uname -r` 自己确认，别照抄 khp README 里的数字，
+> 也别照抄这里的。
 
 ### 为什么必须靠外部守护进程
 
@@ -1114,7 +1115,7 @@ end
 
 ```json
 "connections": [{
-  "address": "04:33:85:2C:BF:5B",
+  "address": "AA:BB:CC:DD:EE:FF",
   "input_paths": ["/dev/input/event2"],
   "battery_level": 98,
   "battery_updated": 1788515691.4
@@ -1125,7 +1126,7 @@ end
 本插件唯一认的设备身份（§9）。khp 自己的插件按 `address` 匹配，我们不需要多引入
 一个身份维度。
 
-> 顺带：`name` 是 `黑鲨双翼手柄L-BF5B`，尾巴 `BF5B` 来自 MAC 的后两字节。这就是
+> 顺带：`name` 是 `黑鲨双翼手柄L-XXXX`，尾巴 `XXXX` 来自 MAC 的后两字节。这就是
 > `display_name` 要存在的原因（见开头字段表）。
 
 ### 用 `wget` 而不是 `socket.http`
