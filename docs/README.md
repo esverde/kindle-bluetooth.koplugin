@@ -1423,6 +1423,25 @@ manager.lua:377      self:_abortWifiConnection()             ← 清 pending_con
 
 升级 KOReader 后要核对的就是这两处行号对应的行为还在不在。
 
+**已在真机验证**（2026-09-13，KOReader 日志）：
+
+```
+22:45:12  khp daemon start requested
+22:45:28  WARN  NetworkMgr:enableWifi: Connection failed!   ← 第 1 次拦截
+22:45:38  WARN  NetworkMgr:enableWifi: Connection failed!   ← 第 2 次仍是「拦截」
+22:45:47  khp daemon stop requested
+22:46:12  Wi-Fi successfully restored (after 6.25 seconds)!
+```
+
+**第二行 WARN 是决定性证据。** 若 `pending_connection` 没被清掉，第二次尝试会
+落进 EBUSY 分支打出 `A previous connection attempt is still ongoing!`
+（`manager.lua:381`），而不是再一次 `Connection failed!`（`manager.lua:376`）。
+它打的是后者，说明 `_abortWifiConnection` 在第一次拦截后确实清干净了。最后一行
+则证明守卫解除后 WiFi 能正常连上。
+
+升级 KOReader 后重跑这个序列即可回归：起守护进程 → 连开两次 WiFi → 停守护进程
+→ 开 WiFi。日志里出现 EBUSY 那句就说明契约变了。
+
 ### 为什么打在 `turnOnWifi` 而不是别处
 
 它是三条路径的共同汇聚点：
