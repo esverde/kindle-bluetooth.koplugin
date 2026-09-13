@@ -7,6 +7,10 @@ return {
 
     invert_layout = false,    -- [可覆盖]：菜单改过之后，改这里不再生效
 
+    -- 有十字键的手柄设 true，并补上 dpad_map；设 false 时菜单里「摇杆模式」灰显，
+    -- use_analog_mode 被强制为 true
+    supports_dpad = false,
+
     -- 8 位有符号，中心 0，极值 ±127
     axis_threshold = 95,
     analog_center = { [0] = 0, [1] = 0 },

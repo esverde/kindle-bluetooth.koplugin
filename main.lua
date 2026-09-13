@@ -43,6 +43,13 @@ local function isDevicePath(path)
     return type(path) == "string" and path:match("^/dev/input/event%d+$") ~= nil
 end
 
+-- 必须判 nil：用 `or` 会把 false 覆盖值吃掉（docs §10）
+local function override(settings, key, from_file)
+    local saved = settings:readSetting(key)
+    if saved == nil then saved = from_file end
+    return saved == true
+end
+
 local BluetoothController = WidgetContainer:extend {
     name = "BluetoothController",
     is_doc_only = false,
@@ -86,6 +93,7 @@ function BluetoothController:applyConfig(cfg)
         { "display_name",        type(cfg.display_name) == "string" and cfg.display_name ~= "" },
         { "trigger_cooldown_ms", isNumberInRange(cfg.trigger_cooldown_ms, 0, 60000) },
         { "axis_threshold",      isNumberInRange(cfg.axis_threshold, 0, 65535) },
+        { "supports_dpad",       type(cfg.supports_dpad) == "boolean" },
         { "key_map",             type(cfg.key_map) == "table" },
         { "analog_map",          type(cfg.analog_map) == "table" },
         { "analog_center",       type(cfg.analog_center) == "table" },
@@ -104,14 +112,20 @@ function BluetoothController:applyConfig(cfg)
         end
     end
 
+    if cfg.supports_dpad and type(cfg.dpad_map) ~= "table" then
+        logger.warn("BT Plugin: supports_dpad is set but dpad_map is missing")
+        return false
+    end
+
     self.config = {}
     for k, v in pairs(cfg) do
         self.config[k] = v
     end
-    -- 必须判 nil：用 `or` 会把 false 覆盖值吃掉（docs §10）
-    local saved = self.settings:readSetting("invert_layout")
-    if saved == nil then saved = cfg.invert_layout end
-    self.config.invert_layout = saved == true
+    self.config.invert_layout = override(self.settings, "invert_layout", cfg.invert_layout)
+    -- 没有十字键就锁死摇杆模式，忽略覆盖值：否则一份陈旧的 use_analog_mode = false
+    -- 会配上一个不发 HAT 事件的手柄，变成完全不能翻页且菜单里改不回来（docs §11）
+    self.config.use_analog_mode = not cfg.supports_dpad
+        or override(self.settings, "use_analog_mode", cfg.use_analog_mode)
     resetInputState()
     logger.info("BT Plugin: Loaded config for " .. cfg.device_path)
     return true
@@ -399,9 +413,19 @@ function BluetoothController:parseInputDirection(ev)
         return self.config.key_map[ev.code]
     end
 
-    if ev.type == C.EV_ABS then return self:parseAnalogInput(ev) end
+    if ev.type == C.EV_ABS then
+        if self.config.use_analog_mode then return self:parseAnalogInput(ev) end
+        return self:parseDpadInput(ev)
+    end
 
     return nil
+end
+
+-- 十字键走 EV_ABS 的 HAT 轴（16/17），value 为 ±1，回中是 0
+function BluetoothController:parseDpadInput(ev)
+    if ev.value == 0 then return nil end
+    local axis_map = self.config.dpad_map[ev.code]
+    return axis_map and axis_map[ev.value]
 end
 
 function BluetoothController:parseAnalogInput(ev)
@@ -497,6 +521,30 @@ function BluetoothController:addToMainMenu(menu_items)
             self.settings:saveSetting("invert_layout", self.config.invert_layout)
             self.settings:flush()
         end
+    })
+
+    -- 没有十字键的手柄这一项灰显。灰显是安全的：applyConfig 已强制锁死摇杆模式，
+    -- 不会出现「改不回来又收不到 HAT 事件」那个死局（docs §11）
+    local function modeItem(text, analog)
+        return {
+            text = text,
+            checked_func = function() return self.config.use_analog_mode == analog end,
+            callback = function()
+                self.config.use_analog_mode = analog
+                resetInputState()
+                self.settings:saveSetting("use_analog_mode", analog)
+                self.settings:flush()
+            end,
+        }
+    end
+
+    table.insert(sub_items, {
+        text = _("摇杆模式"),
+        enabled_func = function() return self.config.supports_dpad end,
+        sub_item_table = {
+            modeItem(_("模拟摇杆"), true),
+            modeItem(_("方向键"), false),
+        },
     })
 
     table.insert(sub_items, {
