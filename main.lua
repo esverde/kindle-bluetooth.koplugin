@@ -142,28 +142,32 @@ end
 -- 这是全仓库唯一一处 monkey patch，它依赖的两个 KOReader 行为见 docs §14
 function BluetoothController:installWifiGuard()
     if _wifi_guard_installed then return end
-
     local NetworkMgr = require("ui/network/manager")
-    local original = NetworkMgr.turnOnWifi
-    if type(original) ~= "function" then
-        logger.warn("BT Plugin: NetworkMgr.turnOnWifi missing, WiFi guard not installed")
-        return
-    end
-    _wifi_guard_installed = true
 
-    NetworkMgr.turnOnWifi = function(mgr, ...)
-        if _current_active_controller
-            and _current_active_controller:isDaemonRunning() then
-            UIManager:show(InfoMessage:new{
-                text = _("请先关闭蓝牙守护进程，再开 WiFi"),
-                timeout = 4,
-            })
-            -- 必须 false：这是 KOReader 的「连接失败」契约，enableWifi 据此调
-            -- _abortWifiConnection 清掉 pending_connection。返回 nil 会让之后
-            -- 所有开 WiFi 都被 EBUSY 挡死（manager.lua:68、375）
-            return false
+    -- turnOnWifi 是菜单/手势与插件自动联网的汇聚点；restoreWifiAsync 绕开它，
+    -- 走的是唤醒时的 auto_restore_wifi 那条静默路径（networklistener.lua:224）
+    for _i, name in ipairs({ "turnOnWifi", "restoreWifiAsync" }) do
+        local original = NetworkMgr[name]
+        if type(original) ~= "function" then
+            logger.warn("BT Plugin: NetworkMgr." .. name .. " missing, guard not installed")
+        else
+            _wifi_guard_installed = true
+            NetworkMgr[name] = function(mgr, ...)
+                if _current_active_controller
+                    and _current_active_controller:isDaemonRunning() then
+                    UIManager:show(InfoMessage:new{
+                        text = _("请先关闭蓝牙守护进程，再开 WiFi"),
+                        timeout = 4,
+                    })
+                    -- turnOnWifi 必须返回 false：这是 KOReader 的「连接失败」契约，
+                    -- enableWifi 据此调 _abortWifiConnection 清掉 pending_connection，
+                    -- 返回 nil 会让之后所有开 WiFi 都被 EBUSY 挡死（manager.lua:68、375）。
+                    -- restoreWifiAsync 是 fire-and-forget，没有返回值契约，false 无害
+                    return false
+                end
+                return original(mgr, ...)
+            end
         end
-        return original(mgr, ...)
     end
 end
 

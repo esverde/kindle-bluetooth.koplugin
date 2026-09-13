@@ -1453,13 +1453,30 @@ manager.lua:377      self:_abortWifiConnection()             ← 清 pending_con
 
 打在 `toggleWifiOn` 会漏掉自动联网那条。
 
-### 三条覆盖不到的路径
+### 第二处：`restoreWifiAsync`（`auto_restore_wifi` 的路径）
+
+**`restoreWifiAsync` 绕开 `turnOnWifi`**，所以第一处补丁拦不到它。它有两个调用点：
+
+| 调用点 | 时机 | 能否补丁 |
+| --- | --- | --- |
+| `networklistener.lua:224` | **每次唤醒**（`onResume`） | **能** —— 这是真正危险的那条 |
+| `manager.lua:159` | KOReader 启动时（模块加载期） | **不能** —— 早于插件加载 |
+
+唤醒那条才是重点：Kindle 一天唤醒几十次，`auto_restore_wifi` 开着 + 守护进程在跑
+= 随机时刻静默卡死射频。**这是「本机没有静默切换路径」那个结论的唯一例外。**
+
+> 曾经写过「`restoreWifiAsync` 只有 `manager.lua:159` 一个调用点，补丁没有意义」
+> —— **那是错的**，当时只 grep 了 `manager.lua`，漏掉了 `networklistener.lua`。
+
+它是 fire-and-forget，**没有返回值契约**，所以拦截时不调用原函数即可；返回 `false`
+也无害（与 `turnOnWifi` 共用同一个包装）。
+
+### 两条仍然覆盖不到的路径
 
 | 路径 | 说明 |
 | --- | --- |
 | **Kindle 原生设置界面** | KOReader 完全不知情。这同时是**逃生出口** —— 万一守护进程卡死关不掉，还能从原生界面开 WiFi |
-| **`auto_restore_wifi` 启动时的那次恢复** | `manager.lua:159` 在模块加载时就跑了，**早于插件加载**，来不及打补丁。而守护进程用 `setsid` 脱离了进程组，能跨 KOReader 重启存活，所以这个组合真实存在。对策只能是保持该设置关闭（默认就是关的，见 §12） |
-| **`restoreWifiAsync`** | 同上，它只有 `manager.lua:159` 一个调用点，补丁没有意义 |
+| **KOReader 启动时的那次 `restoreWifiAsync`** | `manager.lua:159` 在模块加载期执行，早于插件。而守护进程用 `setsid` 脱离了进程组，能跨 KOReader 重启存活，所以这个组合真实存在。对策只能是保持 `auto_restore_wifi` 关闭（默认就是关的，见 §12） |
 
 ### 副作用：作用域是全局的
 
