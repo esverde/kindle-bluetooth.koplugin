@@ -1058,28 +1058,61 @@ util.shell_escape({ self.path .. "/khp/dist/main.bin" })
 
 - **停是同步的**：`pkill` 的那一秒 uevent 就到，fd 立刻释放。
 - **起要约 5s**：守护进程自身约 3s 就绪，之后还要重连 BLE、建 uhid 节点。
-  所以 `DAEMON_START_DELAY = 6` 不是拍的 —— 它刚好落在节点出现之后，
-  那句「守护进程已启动」才会在设备真的回来之后弹出。改这个常量前先看这段时序。
 - 重连**全自动**，不需要手动「重新加载设备」：`onEvdevInputInsert` 接住
   uevent，等 `RECONNECT_SETTLE_DELAY` 后 `Opened device`。
 
-所以：
+### 没有延时回查：两个方向本来就已经有反馈
 
-- 点击后先弹「正在启动/停止…」
-- `UIManager:scheduleIn(6, …)` 再查一次并报结果 —— **不用阻塞 sleep**。
-  khp 插件那边是 `ffiutil.sleep(1)` 循环 + `START_TIMEOUT = 15`，会**卡住
-  KOReader UI 线程最多 15 秒**，e-ink 上就是整机假死。
-- 延时回调**只弹 InfoMessage，不碰菜单控件** —— 用户可能已经关掉菜单，
-  在死控件上 `updateItems` 是自找麻烦。状态由 `checked_func` 下次重绘时自然刷新。
-- 回调是**方法 `self:_daemonCheck()`** 而不是匿名闭包，这样 `onExit` 能
-  `unschedule` 掉。匿名闭包会持有 `self`，也就连带持有 ReaderUI ——
-  这类泄漏在本仓库出现过一次。排程时按 `_reconnect` 的同一形状传
-  `scheduleIn(delay, self._daemonCheck, self)`。
-  （`UIManager:unschedule(nil)` 是安全空操作：每个已排程任务的 `action` 都非 nil，
-  `uimanager.lua:440` 的比较不会命中。）
+曾经有个 `_daemonCheck`：点击后 `scheduleIn(6, …)`（停止是 1s）再查一次状态并
+弹「守护进程已启动 / 已停止」。**整段删掉了**，因为它在造第二个喇叭：
 
-**不主动 `reloadDevice()`。** 节点是手柄连上时才出现的，可能晚于那 6 秒；
-而那条路已经由 `onEvdevInputInsert` 兜住（§2，已实测）。
+| 动作 | 已经存在的反馈 |
+| --- | --- |
+| 起 | 节点出现 → `onEvdevInputInsert` → `_reconnect` 弹**「手柄已重新连接」** |
+| 停 | 节点**同一秒**消失，手柄当场失效 —— 这就是「停了」对用户的全部含义 |
+
+而它带来的是一个真 bug：停止的回查排在 **+1s**，此时进程往往还在退出中
+（异常态下要 10s，见下），`isDaemonRunning()` 仍为真 → 弹出**「守护进程已启动」**
+→ 用户以为没停掉，再点一次。实测日志里每次停止都被点了两遍。
+
+那 10s 是 Bumble 的 HCI 命令超时：芯片没载固件时
+`HCI_LE_CREATE_CONNECTION_CANCEL_COMMAND` 发不出去，必须等超时到期。三次实测
+间隔 10.05 / 10.06 / 10.09 秒，与第二次点击无关（第二次点击落在 8s，早于超时）。
+
+**把固定秒数改大是错的**：健康时停止是同一秒生效，等 12s 纯属白等；异常时又可能
+不够。改成轮询也不对 —— 那是在给已有的反馈再包一层。
+
+**不主动 `reloadDevice()`。** 节点是手柄连上时才出现的，而那条路已经由
+`onEvdevInputInsert` 兜住（§2，已实测）。
+
+### 上游那套等待为什么不能抄
+
+khp 插件的 `_waitForState`（`koreader-plugin/hidpassthrough.koplugin/main.lua:870`）：
+
+```lua
+for i = 1, timeout do
+    ffiutil.sleep(1)                -- 阻塞整个 UI 线程
+    local state = self:getState()   -- 每 tick 一个 HTTP 请求
+    if state == target then return true end
+end
+```
+
+`START_TIMEOUT = 15`，e-ink 上最坏**冻结 15 秒**，期间翻页刷新全停。它的 `start()`
+有 45 行、三态机、两处嵌套 `_waitForState`，那些复杂度全来自 `/stop` 只停 HID 层
+（§12 开头）。
+
+### 菜单勾选会有短暂残留，这是刻意接受的
+
+停止之后若立刻重开菜单，`checked_func`（查的是进程存活性）可能仍显示勾选，直到
+进程真的退出。**诚实的「立刻 uncheck」做不到**，两条路都被否过：
+
+| 做法 | 为什么否 |
+| --- | --- |
+| 乐观状态（点了就记成关） | 反方向说谎：守护进程被崩溃 / OOM / 外部 kill 掉时，勾选会一直亮着 |
+| 点击后 `updateItems()` 重绘 | 时序不对 —— 同一个 tick 里 `os.execute` 刚返回，SIGTERM 可能还没送达，`isDaemonRunning()` 仍为真，重绘出来还是勾选 |
+
+而且这个残留窗口只在**异常态**（WiFi 关着起守护进程、芯片没载固件）才有 10s 量级；
+健康时进程当场就退了。装了 §14 的 WiFi 守卫之后基本见不到。
 
 ### `isDaemonRunning` 刻意不带缓存
 
@@ -1345,6 +1378,83 @@ grep -E 'auto_(restore|disable)_wifi' /mnt/us/koreader/settings.reader.lua
 这与 §11 里那个 `media_remote=false` 无关。那一项关的是 khp 自己的经典蓝牙
 页面扫描，属于 khp 内部行为；本条冲突发生在**芯片层**，khp 只要在跑就成立，
 和 khp 的任何配置项都无关。
+
+---
+
+## §14 WiFi 守卫：全仓库唯一一处 monkey patch
+
+守护进程运行时开 WiFi 会把射频卡死到重启（§12）。`installWifiGuard` 在 `init`
+里替换 `NetworkMgr.turnOnWifi`，守护进程在跑就弹提示并拒绝。
+
+**这是本仓库唯一一处 monkey patch。** 其余所有对接都走文档化扩展点
+（`registerEventAdjustHook`、`registerToMainMenu`、`onEvdevInputInsert`、
+`onDispatcherRegisterActions`）。这一处不同：`turnOnWifi` 是 KOReader 内部函数，
+**没有任何兼容性承诺**。所以下面两条依赖必须写下来，KOReader 升级后照着核对。
+
+### 依赖一：事件钩子拦不住，只能替换函数
+
+`NetworkConnecting` / `NetworkDisconnecting` 是**通知，不是否决权**：
+
+```
+manager.lua:74    broadcastEvent(Event:new("NetworkConnecting"))
+manager.lua:77    return self:turnOnWifi(wifi_cb, interactive)   ← 无条件执行
+manager.lua:413   broadcastEvent(Event:new("NetworkDisconnecting"))
+manager.lua:425   self:turnOffWifi(complete_callback)            ← 同样
+```
+
+处理器返回 true 只停止继续传播，拦不住后面那行。所以只能替换函数本身。
+
+### 依赖二：必须返回 `false`，否则 WiFi 会被永久锁死
+
+```lua
+manager.lua:67   function NetworkMgr:requestToTurnOnWifi(...)
+manager.lua:68       if self.pending_connection then return EBUSY end
+manager.lua:75       self.pending_connection = true          ← 先置位
+manager.lua:77       return self:turnOnWifi(...)             ← 才调下去
+
+manager.lua:373  local status = self:requestToTurnOnWifi(...)
+manager.lua:375  if status == false then
+manager.lua:377      self:_abortWifiConnection()             ← 清 pending_connection
+```
+
+**拦截时返回 nil 会让 `pending_connection` 永久停在 true** —— 之后哪怕关掉守护
+进程，WiFi 也再开不起来，除非重启 KOReader。返回 `false` 走的是 KOReader 自己的
+「连接失败」契约，`_abortWifiConnection`（`manager.lua:44-63`）会把状态清干净。
+
+升级 KOReader 后要核对的就是这两处行号对应的行为还在不在。
+
+### 为什么打在 `turnOnWifi` 而不是别处
+
+它是三条路径的共同汇聚点：
+
+```
+菜单 / 手势   → toggleWifiOn(433)      → enableWifi(358) → requestToTurnOnWifi(67) ┐
+插件自动联网  → beforeWifiAction(605)  → promptWifiOn(460) → …                     ├→ turnOnWifi
+```
+
+打在 `toggleWifiOn` 会漏掉自动联网那条。
+
+### 三条覆盖不到的路径
+
+| 路径 | 说明 |
+| --- | --- |
+| **Kindle 原生设置界面** | KOReader 完全不知情。这同时是**逃生出口** —— 万一守护进程卡死关不掉，还能从原生界面开 WiFi |
+| **`auto_restore_wifi` 启动时的那次恢复** | `manager.lua:159` 在模块加载时就跑了，**早于插件加载**，来不及打补丁。而守护进程用 `setsid` 脱离了进程组，能跨 KOReader 重启存活，所以这个组合真实存在。对策只能是保持该设置关闭（默认就是关的，见 §12） |
+| **`restoreWifiAsync`** | 同上，它只有 `manager.lua:159` 一个调用点，补丁没有意义 |
+
+### 副作用：作用域是全局的
+
+补丁替换的是全局单例上的方法，**整个 KOReader 会话都受影响** —— OPDS、进度同步、
+词典下载这些要联网的功能都会撞上守卫。这是设计意图（我们就是要拦所有路径），
+但不要以为它只管菜单里手动点的那一次。
+
+不需要在 `onExit` 里卸载：守卫靠 `_current_active_controller` 判断，插件退出时
+该变量置 nil，补丁自动失效。补丁只活在进程里，重启 KOReader 即恢复。
+
+### `type(original) ~= "function"` 的防御不能删
+
+KOReader 要是改名或删掉 `turnOnWifi`，没有这一判就会把 `nil` 当函数存下来，
+之后每次开 WiFi 都崩。有了它，最坏只是少一个守卫并留一行 warn。
 
 ---
 

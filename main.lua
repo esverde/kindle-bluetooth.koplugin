@@ -18,7 +18,6 @@ local C = ffi.C
 
 local POWER_RESET_INTERVAL = 60
 local RECONNECT_SETTLE_DELAY = 0.5
-local DAEMON_START_DELAY = 6
 
 local DUMP_TARGETS = {
     { directory = "/mnt/us", patterns = {
@@ -33,6 +32,7 @@ local DUMP_TARGETS = {
 local _shared_last_trigger_time
 local _shared_last_power_reset_time
 local _shared_hook_registered = false
+local _wifi_guard_installed = false
 local _shared_triggered = false
 local _deflected_axes = {}
 local _current_active_controller
@@ -69,6 +69,7 @@ function BluetoothController:init()
     self:loadSettings()
     self.ui.menu:registerToMainMenu(self)
     self:registerInputHook()
+    self:installWifiGuard()
     self:openDevice(false)
 end
 
@@ -135,6 +136,35 @@ function BluetoothController:registerInputHook()
         if _current_active_controller then _current_active_controller:handleInputEvent(ev) end
     end)
     _shared_hook_registered = true
+end
+
+-- 守护进程攥着 CONSYS 芯片时开 WiFi 会让射频卡死到重启，抢在动作之前拦下来。
+-- 这是全仓库唯一一处 monkey patch，它依赖的两个 KOReader 行为见 docs §14
+function BluetoothController:installWifiGuard()
+    if _wifi_guard_installed then return end
+
+    local NetworkMgr = require("ui/network/manager")
+    local original = NetworkMgr.turnOnWifi
+    if type(original) ~= "function" then
+        logger.warn("BT Plugin: NetworkMgr.turnOnWifi missing, WiFi guard not installed")
+        return
+    end
+    _wifi_guard_installed = true
+
+    NetworkMgr.turnOnWifi = function(mgr, ...)
+        if _current_active_controller
+            and _current_active_controller:isDaemonRunning() then
+            UIManager:show(InfoMessage:new{
+                text = _("请先关闭蓝牙守护进程，再开 WiFi"),
+                timeout = 4,
+            })
+            -- 必须 false：这是 KOReader 的「连接失败」契约，enableWifi 据此调
+            -- _abortWifiConnection 清掉 pending_connection。返回 nil 会让之后
+            -- 所有开 WiFi 都被 EBUSY 挡死（manager.lua:68、375）
+            return false
+        end
+        return original(mgr, ...)
+    end
 end
 
 -- 切换 input_no_key_repeat 会清空整条 hook 链（docs §5）
@@ -326,13 +356,6 @@ function BluetoothController:readBatteryLevel()
     logger.dbg("BT Plugin: battery read failed: " .. tostring(level))
 end
 
-function BluetoothController:_daemonCheck()
-    UIManager:show(InfoMessage:new{
-        text = self:isDaemonRunning() and _("守护进程已启动") or _("守护进程已停止"),
-        timeout = 2,
-    })
-end
-
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
     if self:openDevice(true) then
@@ -464,13 +487,12 @@ function BluetoothController:addToMainMenu(menu_items)
                 return
             end
             if not starting then self:stopDaemon() end
+            -- 不做延时回查：起来了由 onEvdevInputInsert → _reconnect 报「手柄已重新
+            -- 连接」，停掉了节点当场消失，两个方向都已有反馈（docs §12）
             UIManager:show(InfoMessage:new{
                 text = starting and _("正在启动守护进程…") or _("正在停止守护进程…"),
                 timeout = 2,
             })
-
-            UIManager:unschedule(self._daemonCheck)
-            UIManager:scheduleIn(starting and DAEMON_START_DELAY or 1, self._daemonCheck, self)
         end,
     })
 
@@ -534,14 +556,13 @@ function BluetoothController:addToMainMenu(menu_items)
 
     menu_items.bluetooth_controller = {
         text = _("蓝牙翻页器"),
-        sorting_hint = "tools",
+        sorting_hint = "network",
         sub_item_table = sub_items,
     }
 end
 
 function BluetoothController:onExit()
     UIManager:unschedule(self._reconnect)
-    UIManager:unschedule(self._daemonCheck)
     if _current_active_controller == self then
         self:closeDevice()
         _current_active_controller = nil
