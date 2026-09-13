@@ -283,26 +283,18 @@ with an evdev device node… We intentionally don't filter on devpath"。
   `KindleGyroTransform`（`kindle/device.lua:1880`）一起冲掉。这是 KOReader 自身的问题，
   不是本插件造成的 —— 表现为在 Scribe 上开关"禁用按键重复"后陀螺仪旋转失效。
 
-## §6 lipc（蓝牙状态）—— 本分支已整段删除
+## §6 不碰 Amazon 的蓝牙状态
 
-主分支用 `lipc com.lab126.btfd` 的 `BTstate` / `BTflightMode` 读写 Amazon 原生栈的
-开关状态，对应 `btLipc` / `getRealState` / `getDisplayState` / `setBluetoothState`、
-`toggle_kindle_bluetooth` 这个 Dispatcher 动作，以及菜单里的「蓝牙开关」项。
+**原则：射频归 khp 管，插件只做 evdev 消费者。**
 
-**本分支把这些全部删掉了（-77 行）。理由不是精简，是正确性：**
+khp 独占 `/dev/stpbt` 直驱蓝牙硬件（绕开内核 BT 子系统，见 §11）。插件再去
+`lipc-set-prop com.lab126.btfd BTflightMode` 开关 Amazon 那套栈，等于两个进程抢
+同一块射频 —— khp 自己踩过这个坑（上游 PR #192 *"Fix the Bluetooth toggle
+getting stuck on or off"*）。
 
-BLE 链路由 kindle-hid-passthrough 建立，它**独占 `/dev/stpbt`** 直接驱动蓝牙硬件
-（绕开内核 BT 子系统 —— PW6 上 `/sys/class/bluetooth/` 根本不存在，见 §11）。
-插件再去 `lipc-set-prop com.lab126.btfd BTflightMode` 开关 Amazon 那套栈，
-等于两个进程抢同一块射频。khp 自己就踩过这个坑（上游 PR #192
-*"Fix the Bluetooth toggle getting stuck on or off"*）。
-
-所以本分支的原则是：**射频归 khp 管，插件只做 evdev 消费者，不碰蓝牙状态。**
-
-原始的 lipc 事实（`get_int_property` 失败返回 nil 而不抛错、`set_int_property`
-没有可靠成功信号、`BTstate` 开启时返回 `2` 而不是 `1`、`liblipclua` 来自固件
-`/usr/lib/lua/` 而非 KOReader 的 `common/`）全部仍然有效，**记录在主分支的
-`docs/README.md` §6**。要在本分支重新引入蓝牙开关之前，先读那一节。
+所以本分支没有 `getRealState` / `setBluetoothState` / 「蓝牙开关」菜单项。
+那套 lipc 代码与其全部实测事实仍在**主分支的 `docs/README.md` §6**，
+要重新引入之前先读那一节。
 
 ## §7 KOReader API 用法
 
@@ -334,9 +326,9 @@ return iterator
 所以外面套一层 `lfs.attributes(dir, "mode") == "directory"` 判断
 （同 `externalkeyboard.koplugin` 的做法）。
 
-**这个 bug 真实发生过**：`cleanupBluetoothDumps` 曾因此在点击「清理蓝牙垃圾」时
-让 KOReader 直接退出。它躲过了五轮真机测试，因为那条菜单项从来没被点过 ——
-教训是冒烟测试表必须覆盖每一个菜单项。
+**这个 bug 真实发生过**：早先那个清理转储文件的功能（后来整个删掉了）曾因此在点击
+菜单项时让 KOReader 直接退出。它躲过了五轮真机测试，因为那条菜单项从来没被点过
+—— 教训是冒烟测试表必须覆盖每一个菜单项。
 
 ## §8 日志
 
@@ -392,14 +384,14 @@ if ok or err == C.ENODEV then
 | `isNumberInRange` | 不单独判 NaN/±inf —— 它们过不了 `>=` / `<=` 比较 |
 | `applyConfig` 的字段归一化 | 全局唯一的配置校验点，因此输入热路径（`parseInputDirection` 及以下）不再逐字段查类型 |
 | `applyConfig` 用 `for k,v in pairs(cfg)` 整表拷贝 | 不逐字段枚举赋值 —— 那样每加一个配置项都要在这里同步一次，漏一个就是「改了配置不生效」。拷完再单独覆盖唯一那个可被菜单改的项 |
-| `startDaemon` 先 `lfs.attributes` 判存在 | `khp/` 在 `.gitignore` 里，「新克隆后守护进程二进制不存在」是最可能的实际场景。少了这一判，症状会从「找不到守护进程」退化成 6 秒后一句误导性的「守护进程已停止」 |
+| `startDaemon` 先 `lfs.attributes` 判存在 | `khp/` 在 `.gitignore` 里，「新克隆后守护进程二进制不存在」是最可能的实际场景。少了这一判，`setsid` 会静默失败，症状退化成「点了没反应」 |
 | `opened_fd` 字段 | 开设备时记下 fd，输入热路径上省一次表查。每次 open 后必须重读 —— 实测同一手柄在不同会话里拿到过 13 和 16 |
 | `handleInputEvent` 的 fd 闸门 | 只认手柄那一个 fd，触屏事件在此被挡住，所以不需要额外的 `ABS_MT`（轴码 ≥ 47）预过滤。保留 `not self.opened_fd or` 判空是因为无法证明不存在 `ev.fd == nil` 的事件路径 |
 | `closeDevice` 无参调用 | 只关自己开过的节点（回退到 `opened_path`，不回退到 `config.device_path`），别去动别人的 fd |
 | `onEvdevInputInsert` 里先 `unschedule` | 快速插拔时才不会堆叠出多个重连任务 |
 | `onEvdevInputRemove` 立刻关闭 | 节点消失就放掉 fd，不必等下一次 `openDevice` 去发现它已经死了 |
 | `axis_threshold` / `trigger_cooldown_ms` 直接读 `self.config` | 两者都是**必填无默认**（`applyConfig` 的 checks 表），校验过了热路径才敢直接索引 |
-| `DEVICE_TAGS` 存原文 | `_()` 在使用处调用；模块只加载一次，在表里翻译会把语言冻结在加载时刻 |
+| `DEVICE_TAGS` 的 `_()` 写在字面量上 | 曾经「存原文、使用处再 `_()`」，但 `_()` 包运行期变量 gettext 提取不到，等于白调。现在四个串都是字面量，可被提取 |
 
 ## §10 配置分两个文件
 
@@ -622,37 +614,12 @@ API 端口 8321 被占。先 `pkill -f ld-linux-armhf`。
 → `--diagnostics`。注意 `--diagnostics` **不打** `Config base path`，而且它那段
 `===== Daemon log tail =====` 是历史日志，别拿来当当前状态读。
 
-### config.ini 各项
+### config.ini：只记本机的偏离
 
-**每个键都有默认值，所以整份 `config.ini` 都是可选的。** `Config._load` 用的是
-带默认值的三参包装 `_get(section, key, default)` / `_getint`：
+各配置项的字面含义看上游出厂 `config.ini` 的注释，这里只记**迁移到插件目录后
+必须自己处理的三件事**。每个键都有默认值，所以整份文件都是可选的。
 
-```
-_get "paths" "cache_dir"      → 默认 <base>/cache
-_get "paths" "devices_config" → 默认 <base>/devices.conf
-_get "logging" "log_file"     → 默认 /var/log/hid_passthrough.log
-```
-
-（这是从 stripped 二进制的字符串邻接**推**出来的，很强但不是证明。）
-
-由于 base path 已经是 `khp/` 目录，`[paths]` 算出来的默认值和手写的一模一样 ——
-**但仍然建议显式写出来**：迁移时最容易出错的就是这两条（本仓库为此排查了
-一整轮，症状是 `Using device from /mnt/us/kindle_hid_passthrough/devices.conf`）。
-显式写着，下次一眼能看到要改什么；删了就变成隐式行为，得重新推一遍 base path
-的解析顺序。两行的保留成本是零。
-
-**可以整节删掉的**（都是惰性的）：
-
-| 删掉 | 为什么惰性 |
-| --- | --- |
-| `[transport]` | 整节本来全是注释，按机型自动探测 |
-| `[device]` | `name` 本来是注释；`address` 是占位符，只在 `devices.conf` 缺失时作单设备兜底 |
-| `[protocol]` | 同上，只是兜底默认。实际协议按设备记在 `devices.conf` |
-
-**唯一必须显式写的是 `[media_remote] enabled = false`** —— 出厂 `config.ini` 里是
-`true`，靠省略拿不到 `false`。
-
-精简到最小可用：
+最小可用：
 
 ```ini
 [paths]
@@ -672,24 +639,20 @@ enabled = false
 log_file = <khp>/hid_passthrough.log
 ```
 
-`[connection]` 那四个值与 `--diagnostics` 的回显一致，留着无成本；删掉则要赌
-代码里的默认值与它们相同，而那个从二进制里读不出来。
+**1. `[paths]` 两条务必显式写。** base path 已是 `khp/` 目录，算出来的默认值和
+手写的一模一样，但迁移时最容易错的就是这两条 —— 本仓库为此排查了一整轮，症状是
+`Using device from /mnt/us/kindle_hid_passthrough/devices.conf`。显式写着一眼能看
+出要改什么；省略就变成隐式行为，得重新推一遍 base path 的解析顺序。
 
-> `log_file` 挪到 `/mnt/us` 之后就不再是 tmpfs，会一直增长且**重启不清**。
-> khp 没有自带轮转，偶尔看一眼大小。排错时也记得看新路径，别再 tail
-> `/var/log/hid_passthrough.log`（那份不再更新）。
+**2. `log_file` 挪出 tmpfs 之后会一直增长。** `/var/log/` 是 tmpfs、重启即失；
+挪到 `/mnt/us` 就**重启不清**，而 khp 没有自带轮转，偶尔看一眼大小。排错时记得
+看新路径，别再 tail `/var/log/hid_passthrough.log`（那份不再更新）。
 
-其余各项：
+**3. `[media_remote] enabled = false` 是唯一必须显式写的** —— 出厂值是 `true`，
+靠省略拿不到 `false`。理由见下。
 
-| 项 | 说明 |
-| --- | --- |
-| `[connection] reconnect_delay` | 掉线后重连间隔（秒） |
-| `[connection] hci_reset_timeout` / `transport_timeout` / `connect_timeout` | 等 HCI Reset、打开 `/dev/stpbt`、单次连接的上限；前两个会在 `--diagnostics` 里回显 |
-| `[transport] hci_transport` | **保持注释**。按机型自动探测，本机结果是 `file:/dev/stpbt` + `MtkChip` |
-| `[device] name` | Kindle 对外广播的名字，默认用探测到的机型 |
-| `[device] address` | 占位符 `F0:F0:…`。二进制里这个键是 `device_address`，与 `protocol` / `_parse_protocol` 相邻，是「`devices.conf` 缺失时的单设备兜底目标」（对应 `--address` 开关）。有 `devices.conf` 时**不生效** |
-| `[protocol] type` | 同上，只是兜底默认。实际协议按设备记在 `devices.conf`：`04:33:85:2C:BF:5B ble 黑鲨双翼手柄L-BF5B`。所以这里留着 `classic` 也不影响 BLE 手柄 |
-| `[logging] log_file` | 默认 `/var/log/hid_passthrough.log`，tmpfs、重启即失 |
+`[transport]` / `[device]` / `[protocol]` 三节都可以整节删掉：按机型自动探测，
+或只在 `devices.conf` 缺失时作单设备兜底。本机有 `devices.conf`，它们不生效。
 
 #### `[media_remote] enabled` 应改为 `false`
 
@@ -935,7 +898,7 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
 
 - FBInk 分类命中 `JOYSTICK`，`isControllerDevice` 返回 true
 - `Loaded config for /dev/input/event3` → `Opened device /dev/input/event3`
-- 「已连接设备」列出手柄、「清理蓝牙垃圾」正常
+- 「已连接设备」列出手柄，显示 `display_name` 与电量百分比
 - **摇杆翻页正常**（`GotoViewRel` 无日志，靠肉眼确认）—— 删掉模式切换、
   `parseInputDirection` 的 `EV_ABS` 改成单路之后**重新验过一次**
 - **四个面键与两个肩键（310/312）翻页正常**
@@ -1223,29 +1186,18 @@ KOReader 的**菜单搜索**也会调 `sub_item_table_func`（`touchmenu.lua:100
 这和 `scanJoystickDevices` 被菜单搜索触发一次 FBInk 扫描是同一类既有行为，
 不是本功能引入的。
 
-### API 端点全表（`3.15.2-202ef78`，`127.0.0.1:8321`，全为 GET）
+### 只用 `/status`，其余端点不碰
 
-从 `api_server.py` 的 `match path:` 提取，留着免得下次再翻源码：
+`127.0.0.1:8321`，全为 GET。完整端点表见上游 `kindle_hid_passthrough/api_server.py`
+的 `match path:`，不在这里抄一份。
 
-| 端点 | 参数 | 作用 |
-| --- | --- | --- |
-| `/health` | — | 只回 `{"ok":true}` |
-| `/status` | — | 全量状态，含 `battery_level` / `input_paths` / `autostart` |
-| `/devices` | — | 已配对设备列表 |
-| `/start` | — | 起 HID 层（**不是起进程**） |
-| `/stop` | — | 停 HID 层，**留着 API server** ← 三态的来源 |
-| `/scan` `/scan-status` | — | 扫描与轮询 |
-| `/pair` `/pair-status` | `addr` `protocol` `name` | 配对与轮询 |
-| `/connect` | `addr` `protocol` | 连接 |
-| `/disconnect` `/remove` | `addr` | 断开 / 删除配对 |
-| `/discoverable` | `duration` | 让 Kindle 可被发现 |
-| `/logs` | `lines` | 日志尾部 |
-| `/clear-cache` | — | 清缓存 |
-| `/autostart` | `enable` | 开关 upstart 自启 |
+本插件只调 `/status`。另两个偶尔手工排错有用：
 
-> `/autostart?enable=1` 能免去手写 upstart 脚本。但**暂不建议开**：自启意味着
-> 开机就攥着射频，于是每次开 WiFi 都得先停它（§12）。等「先连 WiFi 再起守护
-> 进程」这套流程用稳了再说。
+- `/health` —— 只回 `{"ok":true}`，比 `/status` 轻
+- `/logs?lines=200` —— 取日志尾部
+
+> `/autostart?enable=1` 能免去手写 upstart 脚本，但**暂不建议开**：自启意味着
+> 开机就攥着射频，于是每次开 WiFi 都得先停它（§12）。
 
 ### ⚠️ 守护进程运行期间不要开关 WiFi —— 会把射频卡死到重启
 
@@ -1494,6 +1446,63 @@ KOReader 要是改名或删掉 `turnOnWifi`，没有这一判就会把 `nil` 当
 
 ---
 
+## §15 与主分支合并：核实过的事实（方案本身已取消）
+
+曾写过一份逐任务的合并计划（`docs/plans/2026-09-04-unify-classic-ble.md`，869 行），
+用户决定不做，整份删掉了。只保留下面这些**核实过、且重新查一遍要花时间**的事实。
+真要合并时从这里起步，不必再推一遍。
+
+### 分支拓扑：不能用 merge
+
+```
+merge-base(main, ble) == main 的 tip
+main 在基点之后：0 个提交
+```
+
+`main` 是 `ble` 的**祖先**，`git merge main` 只会输出 `Already up to date.`。经典蓝牙
+那套代码是被 `56ee51d` 从共同历史里删掉的，唯一来源是 `git show e97a38b:main.lua`，
+得手工挑段落添加。
+
+反过来说，`ble` 侧的精简**不可能被 merge 冲掉**。真正的风险是**手工取回时连带抄回
+已删的东西**：`override`、`saveOverride`、`reloadDevice`、`btLipc`、`all_centered`
+循环、类表上那些空操作字段。
+
+### 取回的代码是「老标准下审过的」
+
+经典蓝牙那块在共同历史里过了 3 轮 ponytail，但 `ble` 后续几轮的规则没作用到它。
+至少三处要顺手改：`btLipc()` 单调用点内联进 `getRealState`；`setBluetoothState` 里
+两个单次使用的局部变量合并；类表上的 `_state_cached = false` 删掉。
+
+**一条明确不能动**：`onDispatcherRegisterActions` 看着是 8 行单调用点，但
+`dispatcher.lua:640` 会 `broadcastEvent(Event:new("DispatcherRegisterActions"))`，
+L648-653 的官方示例正是「定义同名方法**并且**在 init 里自己调一次」。内联或改名
+会让插件在 Dispatcher 重建动作表时丢失注册。
+
+### 多配置与菜单分流的两个关键点
+
+**`sub_item_table_func` 在任意层级生效**，包括顶层插件条目（`touchmenu.lua:875`：
+`item.sub_item_table_func and item.sub_item_table_func() or item.sub_item_table`，
+在 `onMenuSelect` 里通用处理）。所以「菜单每次打开重建、不相关的项直接不发出来」
+是可行的，比 `enabled_func` 灰显干净。注意菜单**搜索**也会调它
+（`touchmenu.lua:1005`），所以构建函数必须便宜。
+
+**`supports_dpad` 有个会锁死的坑**：主分支用 `enabled_func` 灰显「摇杆模式」。若
+覆盖值里存过 `use_analog_mode = false`，之后换成没有十字键的手柄，会得到「菜单灰显
+改不回来 + 走十字键解析路径 + 手柄不发 HAT 事件」= **完全不能翻页**。这是当初在
+本分支整段删掉模式切换的原因（`c2b4f29`）。重新引入必须同时加：`supports_dpad`
+为假时强制 `use_analog_mode = true`，忽略覆盖值。
+
+### 被否掉的四个方案
+
+| 方案 | 为什么不做 |
+| --- | --- |
+| 抽 `ClassicDriver` / `BleDriver` 接口 | 两个实现、永远两个。`if link == "classic"` 出现 3 次比接口加两个文件短 |
+| 按手柄名自动匹配配置 | 要维护名字模式表，而 `device_path` 已经够用 |
+| 迁移旧的扁平覆盖值 | 两个字段、一个用户，最坏是进菜单重点一次。迁移代码是永久成本 |
+| `khp` 路径做成每配置可配 | 它是插件目录内的固定位置 |
+
+---
+
 # 验证方法
 
 本地没有 x86 Lua 解释器时，改完只能靠人工复核 —— 上机前务必做第 0 步。
@@ -1529,19 +1538,19 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 | 休眠（手柄不断） | 短休眠后唤醒 | **无**任何 BT Plugin 日志；手柄直接可用 |
 | 休眠（手柄掉线） | 休眠 2 分钟以上再唤醒 | 休眠中 `Input device removed:`；唤醒后 `Input device inserted:` → `Opened device` |
 
-**每一个菜单项都要点一遍**，别只测主路径 —— 曾有一次崩溃就是因为「清理蓝牙垃圾」
-五轮测试里一次都没被点过：
+**每一个菜单项都要点一遍**，别只测主路径 —— 曾有一次崩溃是因为某个菜单项在五轮
+测试里一次都没被点过：
 
 | 菜单项 | 期待日志 | 另外确认 |
 | --- | --- | --- |
-| 蓝牙守护进程 → 开 | `khp daemon start requested` → 约 5s 后 `Input device inserted` → `Opened device` | 提示「已启动」；此时会连着弹一条「手柄已重新连接」，两条 toast 各占一次 e-ink 刷新，属正常 |
-| 蓝牙守护进程 → 关 | `khp daemon stop requested` → 同一秒 `Input device removed` → `Closing device` | 提示「已停止」；`ko-input` 打出 `Closed input device with fd: N` |
-| 已连接设备 | `Found input device: …` | 只列手柄，不含触屏/frame tap |
-| 反转方向 | `Saved override invert_layout` | **重启后仍然反转** |
+| 蓝牙守护进程 → 开 | `khp daemon start requested` → 约 5s 后 `Input device inserted` → `Opened device` | 提示「正在启动…」，随后「手柄已重新连接」。**没有第二条就是没连上**（多半 WiFi 关着，见 §12） |
+| 蓝牙守护进程 → 关 | `khp daemon stop requested` → 同一秒 `Input device removed` → `Closing device` | 手柄当场失效；`ko-input` 打出 `Closed input device with fd: N` |
+| 已连接设备 | `Found input device: …` | 只列手柄；显示 `display_name` + 电量百分比 |
+| 反转方向 | 设置文件出现 `invert_layout` | **重启后仍然反转** |
 | 重新加载设备 | `Loaded config for` → `Closing device` → `Opened device` | — |
-| 清理蓝牙垃圾 | `Cleaned up bluetooth dump files` | — |
 
-（主分支还有一项「摇杆模式 → 方向键」，本分支已删，见 §11。）
+WiFi 守卫另测（§14）：起守护进程 → 连开两次 WiFi → 停守护进程 → 开 WiFi。
+两次拦截都该打 `NetworkMgr:enableWifi: Connection failed!`，出现 EBUSY 那句即回归。
 
 「另外确认」里那个**重启后**是配置拆分（§10）的关键验证点：覆盖值存在
 `<settings>/bluetooth_controller.lua`，读取时若误用 `or` 而非判 `nil`，

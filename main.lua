@@ -19,16 +19,6 @@ local C = ffi.C
 local POWER_RESET_INTERVAL = 60
 local RECONNECT_SETTLE_DELAY = 0.5
 
-local DUMP_TARGETS = {
-    { directory = "/mnt/us", patterns = {
-        "^audiomgrd_.*%.core$", "^btmanagerd_.*%.core$", "^Indexer_Dump_.*%.txt$",
-    } },
-    { directory = "/mnt/us/documents", patterns = {
-        "^audiomgrd_.*_crash_", "^btmanagerd_.*_crash_",
-        "audiomgrd.*%.sdr$", "btmanagerd.*%.sdr$",
-    } },
-}
-
 local _shared_last_trigger_time
 local _shared_last_power_reset_time
 local _shared_hook_registered = false
@@ -444,32 +434,6 @@ function BluetoothController:parseAnalogInput(ev)
     return ev.value < center and mapping.low_dir or mapping.high_dir
 end
 
-function BluetoothController:cleanupBluetoothDumps()
-    local paths = {}
-    for _, target in ipairs(DUMP_TARGETS) do
-        -- lfs.dir 必须整体传给 for：它返回 (迭代器, 目录对象)，少了后者迭代器会报错
-        if lfs.attributes(target.directory, "mode") == "directory" then
-            for name in lfs.dir(target.directory) do
-                for _, pattern in ipairs(target.patterns) do
-                    if name:match(pattern) then
-                        table.insert(paths, target.directory .. "/" .. name)
-                        break
-                    end
-                end
-            end
-        end
-    end
-
-    if #paths > 0 then
-        if os.execute("rm -rf -- " .. util.shell_escape(paths) .. " 2>/dev/null") ~= 0 then
-            logger.warn("BT Plugin: Failed to remove bluetooth dumps")
-            return false
-        end
-    end
-    logger.info("BT Plugin: Cleaned up bluetooth dump files")
-    return true
-end
-
 -- [是否当前配置][是否已打开]
 local DEVICE_TAGS = {
     [true]  = { [true] = _(" [当前]"),   [false] = _(" [已配置]") },
@@ -543,17 +507,6 @@ function BluetoothController:addToMainMenu(menu_items)
                     or self:openDevice(true) and _("设备已加载")
                     or _("加载失败"),
                 timeout = 2,
-            })
-        end
-    })
-
-    table.insert(sub_items, {
-        text = _("清理蓝牙垃圾"),
-        callback = function()
-            local cleaned = self:cleanupBluetoothDumps()
-            UIManager:show(InfoMessage:new{
-                text = cleaned and _("已清理蓝牙转储垃圾文件") or _("清理蓝牙转储失败"),
-                timeout = 2
             })
         end
     })
