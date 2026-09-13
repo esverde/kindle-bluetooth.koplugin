@@ -155,30 +155,42 @@ cd /mnt/us/koreader/plugins/bluetooth.koplugin/khp
 Put the controller in pairing mode and follow the prompts. The result is written
 to `devices.conf` and persists across reboots.
 
+> To add a second controller, just run `--pair` again. `devices.conf`
+> accumulates entries and khp serves them all — whichever controller you switch
+> on will connect.
+
 ### 5. Configure and start
 
-Find the input device number your controller was given:
+Find out how the system names your controller:
 
 ```sh
 cat /proc/bus/input/devices
 ```
 
-Look for your controller's name; the line starting with `H: Handlers=` contains
-`eventN`. Put `/dev/input/eventN` into `bluetooth.lua` (see below), then restart
-KOReader and start the daemon from the menu.
+Look for the `N: Name="..."` line. Any distinctive fragment of that name goes
+into `match_name` in `bluetooth.lua` (see below). Then restart KOReader and
+start the daemon from the menu.
 
 ## Configuration
 
 All settings live in `bluetooth.lua` in the plugin directory. The plugin only
 ever reads this file — it never writes to it.
 
-**Every field is required.** If one is missing or out of range, the whole file is
+The file returns an **array of profiles**, one per controller. On startup, and
+whenever a controller connects, the plugin scans the input devices and uses the
+**first profile in array order** whose `match_name` matches something present.
+If both of your controllers are switched on, the one listed first wins.
+
+There is no `device_path` field: the device number comes from the scan, so
+`eventN` drifting between reboots no longer affects anything.
+
+**Every field is required.** If one is missing or out of range, that profile is
 rejected and the reason is logged; there are no silent fallbacks.
 
 | Field | Meaning |
 | --- | --- |
-| `device_path` | The controller's input device, e.g. `/dev/input/event2`. **This number can change** between reboots or firmware updates. |
-| `display_name` | What the menu shows for this controller. The raw name from the system includes a hardware address suffix and is unpleasantly long. |
+| `match_name` | A Lua pattern matched against the controller's system name. The first profile whose pattern matches a connected device wins. |
+| `display_name` | What the menu shows for this controller. The raw system name includes a hardware address suffix and is unpleasantly long. |
 | `trigger_cooldown_ms` | Minimum gap between two page turns, in milliseconds. |
 | `invert_layout` | Swap previous/next. *Changeable from the menu.* |
 | `supports_dpad` | Set `true` only if the controller has a D-pad. When `true`, `dpad_map` is also required. |
@@ -202,13 +214,16 @@ profiles**; an 8-bit stick and a 16-bit stick differ by a factor of 256, and
 getting it wrong means either "nothing happens" or "it flips pages when I
 breathe on it".
 
+Both examples below are entries in the same array — keep the ones you use and
+delete the rest.
+
 ### Controller with stick and buttons, no D-pad
 
 8-bit signed axes, centre `0`, full travel `±127`:
 
 ```lua
-return {
-    device_path = "/dev/input/event2",
+{
+    match_name = "My Pad",
     display_name = "My Controller",
     trigger_cooldown_ms = 500,
 
@@ -228,7 +243,7 @@ return {
         [1] = { low_dir = -1, high_dir = 1 }, -- ABS_Y
         [0] = { low_dir = -1, high_dir = 1 }, -- ABS_X
     },
-}
+},
 ```
 
 ### Xbox Wireless Controller
@@ -238,8 +253,8 @@ over classic Bluetooth and have not yet been re-measured over BLE** — treat th
 as a starting point and verify with the method below.
 
 ```lua
-return {
-    device_path = "/dev/input/event2",
+{
+    match_name = "Xbox",
     display_name = "Xbox Controller",
     trigger_cooldown_ms = 500,
 
@@ -264,8 +279,13 @@ return {
         [1] = { low_dir = 1,  high_dir = -1 },
         [0] = { low_dir = -1, high_dir = 1 },
     },
-}
+},
 ```
+
+> **Only one controller is used at a time.** If both are switched on, both
+> connect at the khp level, but the plugin reads input from the first matching
+> profile only. The other still holds a Bluetooth link and drains its own
+> battery, so switch off the one you are not using.
 
 ## Menu reference
 
@@ -369,8 +389,8 @@ still turn while you measure.
 | --- | --- |
 | Daemon starts but the controller never connects | Wi-Fi is off. Connect Wi-Fi, then restart the daemon. |
 | Wi-Fi will not scan or connect | The radio is wedged. Reboot the Kindle, then always stop the daemon before touching Wi-Fi. |
-| Nothing happens when you press buttons | `device_path` is pointing at the wrong device. Re-check `/proc/bus/input/devices`. |
-| It worked yesterday, not today | The `eventN` number changed. Update `device_path` and use **Reload device**. |
+| Nothing happens when you press buttons | No profile matched. Compare `match_name` with the `N: Name=` line in `/proc/bus/input/devices`. |
+| The wrong controller's settings are applied | Both controllers are on and the other profile is listed first. Switch one off, or reorder the array. |
 | Stick turns several pages at once | `axis_threshold` is too low for this controller. |
 | Stick does not turn pages at all | `axis_threshold` is too high, or `analog_center` is wrong for its range. |
 | Menu entry missing entirely | The plugin failed to load — check `crash.log`. |

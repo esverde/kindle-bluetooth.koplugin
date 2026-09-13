@@ -1504,6 +1504,76 @@ L648-653 的官方示例正是「定义同名方法**并且**在 init 里自己�
 
 ---
 
+## §16 多手柄配置：按名字解析，而不是按节点路径
+
+`bluetooth.lua` 从单份扁平表改成了**配置数组**，生效的那份由 `resolveProfile`
+按「哪个手柄现在在线」决定。
+
+### khp 本身就支持多设备
+
+这是设计的前提，源码证据在 `host.py`：
+
+```python
+def _parse_devices(self):          # devices.conf 里的每一行
+    ... self.classic_devices.append / self.ble_devices.append
+    log.info(f"Devices: {len(self.classic_devices)} Classic, {len(self.ble_devices)} BLE")
+
+async def _serve(self):            # 按协议起 handler，不是按设备
+    if self.ble_devices:
+        tasks.append(asyncio.create_task(self._run_ble_handler(), ...))
+```
+
+`self.sessions` 按地址索引，`_create_uhid_device` / `_destroy_uhid_node(address)`
+表明**每个会话各有一个 uhid 节点**。所以两个手柄都开着时，khp 会各连各的，系统里
+出现两个 `eventN`。配第二个手柄只需再跑一次 `--pair`，`devices.conf` 会累积。
+
+### 为什么改成按名字匹配
+
+原来靠 `device_path` 认设备。两个手柄共用一台机器时这行不通 —— 节点号既会漂移，
+又无法区分谁是谁。而 `scanJoystickDevices` 本来就能拿到设备名（khp 用手柄的蓝牙
+名字命名 uhid 节点，这个名字是稳定的）。
+
+于是 `match_name`（Lua 模式）取代了 `device_path`，**顺带消灭了 `eventN` 漂移
+这个长期痛点**：路径改为由扫描结果给出。
+
+> §15 的「被否掉的方案」表里写着「按手柄名自动匹配 —— 要维护名字模式表，而
+> `device_path` 已经够用」。**那个前提在两个手柄之后不成立了**，所以这条否决翻案。
+> 原判断没错，是条件变了。
+
+### 顺带简化掉的东西
+
+`openDevice` 里的 `isControllerDevice(path)` 整段删了：路径现在只可能来自
+`scanJoystickDevices`，而它只列已被 FBInk 判定为手柄的节点，再查一次是多余的。
+`isDevicePath` 也随 `device_path` 一起删除。
+
+### 三处不能省的判断
+
+| 位置 | 为什么 |
+| --- | --- |
+| `resolveProfile` 里 `pcall(string.match, ...)` | `match_name` 是手写的模式串，落单的 `%` 会让 `:match` 抛错。不 pcall 住就是一个配置笔误崩掉整个插件 |
+| `_reconnect` 的 `was_open` 判断 | `onEvdevInputInsert` 不再按路径过滤（节点号由解析决定），任何输入设备插入都会触发。没有这个判断，触屏之类的无关节点插入也会弹「手柄已连接」 |
+| 覆盖值键名带 `match_name` 前缀 | 两个手柄的「反转方向」「摇杆模式」必须各存各的，否则换手柄会串味 |
+
+### 冲突时的取舍：数组顺序优先
+
+两个手柄都在线时按**数组顺序**取第一个匹配的，而不是按「哪个先连上」。理由是前者
+由用户完全掌控且可预期；后者取决于开机顺序，同样的配置每次行为可能不同。
+
+### 方案 B：两个手柄同时可用（未做）
+
+当前实现同一时刻只用一个手柄。要让两个同时翻页，需要在此基础上：
+
+1. `opened_path` / `opened_fd` 从单值改成表，按 fd 索引
+2. `handleInputEvent` 按 `ev.fd` 查出对应的那份配置，而不是用单一的 `self.config`
+3. **连翻抑制状态必须按设备分开** —— `_deflected_axes` 与 `_shared_triggered`
+   现在是模块级共享的，两个手柄会互相干扰：A 推着杆没回中，B 就翻不了页
+
+约 +40 行，而且改的是全项目最经过实测、出错代价最高的输入热路径。**刻意先不做**：
+实际用法大概率是「这台机器现在用哪个手柄」，而不是两个同时翻页；真需要时在现有
+结构上追加即可，不用推倒重来。
+
+---
+
 # 验证方法
 
 本地没有 x86 Lua 解释器时，改完只能靠人工复核 —— 上机前务必做第 0 步。

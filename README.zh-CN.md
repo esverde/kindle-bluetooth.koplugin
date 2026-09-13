@@ -140,28 +140,37 @@ cd /mnt/us/koreader/plugins/bluetooth.koplugin/khp
 
 把手柄置于配对模式,按提示操作。结果写入 `devices.conf`,重启后仍然有效。
 
+> 要加第二个手柄,再跑一次 `--pair` 即可。`devices.conf` 会累积条目,khp 会同时
+> 服务全部 —— 你开哪个手柄,哪个就连上。
+
 ### 5. 配置并启动
 
-查出手柄拿到的是哪个输入设备号:
+查出系统给手柄起的名字:
 
 ```sh
 cat /proc/bus/input/devices
 ```
 
-找到手柄的名字,它下面以 `H: Handlers=` 开头的那行里含有 `eventN`。把
-`/dev/input/eventN` 填进 `bluetooth.lua`(见下),重启 KOReader,然后从菜单启动
-守护进程。
+找到 `N: Name="..."` 那一行。把名字里有辨识度的一段填进 `bluetooth.lua` 的
+`match_name`(见下),然后重启 KOReader,从菜单启动守护进程。
 
 ## 配置
 
 所有设置都在插件目录下的 `bluetooth.lua` 里。插件**只读这个文件,从不改写它**。
 
-**每一个字段都是必填的。** 缺失或越界会导致整份配置被拒绝并在日志里说明原因,
+文件返回一个**配置数组**,每份对应一个手柄。启动时以及手柄连上时,插件会扫描输入
+设备,**按数组顺序**取第一个 `match_name` 能匹配上在线设备的配置。两个手柄都开着
+时,排在前面的那份赢。
+
+**没有 `device_path` 字段**:节点号来自扫描结果,所以 `eventN` 在重启后漂移不再
+影响任何事情。
+
+**每一个字段都是必填的。** 缺失或越界会导致那份配置被拒绝并在日志里说明原因,
 没有任何静默兜底。
 
 | 字段 | 含义 |
 | --- | --- |
-| `device_path` | 手柄对应的输入设备,例如 `/dev/input/event2`。**这个编号可能变**,重启或固件更新后都可能不同。 |
+| `match_name` | Lua 模式,用来匹配手柄的系统设备名。**数组里第一个匹配上在线设备的配置生效**。 |
 | `display_name` | 菜单里显示的名字。系统给出的原始名字带有硬件地址后缀,又长又难认。 |
 | `trigger_cooldown_ms` | 两次翻页之间的最小间隔,单位毫秒。 |
 | `invert_layout` | 交换上一页/下一页。*可在菜单里修改。* |
@@ -185,13 +194,15 @@ cat /proc/bus/input/devices
 不同手柄的轴量纲差别极大。**绝对不要在不同配置之间抄数值** —— 8 位摇杆和 16 位
 摇杆差 256 倍,抄错的结果要么是「怎么推都没反应」,要么是「碰一下就翻好几页」。
 
+下面两份都是**同一个数组里的元素**,留下你用得到的,其余删掉。
+
 ### 只有摇杆和按键、没有十字键的手柄
 
 8 位有符号轴,中心 `0`,满行程 `±127`:
 
 ```lua
-return {
-    device_path = "/dev/input/event2",
+{
+    match_name = "我的手柄",
     display_name = "我的手柄",
     trigger_cooldown_ms = 500,
 
@@ -211,7 +222,7 @@ return {
         [1] = { low_dir = -1, high_dir = 1 }, -- ABS_Y
         [0] = { low_dir = -1, high_dir = 1 }, -- ABS_X
     },
-}
+},
 ```
 
 ### Xbox 无线手柄
@@ -220,8 +231,8 @@ return {
 重新测过** —— 当作起点用,并按下面的方法自行验证。
 
 ```lua
-return {
-    device_path = "/dev/input/event2",
+{
+    match_name = "Xbox",
     display_name = "Xbox 手柄",
     trigger_cooldown_ms = 500,
 
@@ -246,8 +257,12 @@ return {
         [1] = { low_dir = 1,  high_dir = -1 },
         [0] = { low_dir = -1, high_dir = 1 },
     },
-}
+},
 ```
+
+> **同一时刻只会使用一个手柄。** 两个都开着时 khp 层面会各连各的,但插件只读第一
+> 个匹配上的那份配置对应的设备。另一个仍然占着蓝牙链路、耗着自己的电,所以不用的
+> 那个建议关掉。
 
 ## 菜单说明
 
@@ -341,8 +356,8 @@ cd /mnt/us/koreader && ./luajit /mnt/us/evkeys.lua /dev/input/event2
 | --- | --- |
 | 守护进程起来了但手柄一直连不上 | WiFi 没开。连好 WiFi 后重启守护进程。 |
 | WiFi 扫不到、连不上 | 射频被卡死了。重启 Kindle,之后务必先停守护进程再动 WiFi。 |
-| 按键毫无反应 | `device_path` 指错了设备。重新查 `/proc/bus/input/devices`。 |
-| 昨天还好好的,今天不行了 | `eventN` 编号变了。改 `device_path` 后点**重新加载设备**。 |
+| 按键毫无反应 | 没有配置匹配上。拿 `match_name` 和 `/proc/bus/input/devices` 里的 `N: Name=` 对一下。 |
+| 生效的是另一个手柄的设置 | 两个手柄都开着,而另一份配置排在前面。关掉一个,或调整数组顺序。 |
 | 摇杆一推翻好几页 | 对这个手柄来说 `axis_threshold` 太低。 |
 | 摇杆完全不翻页 | `axis_threshold` 太高,或 `analog_center` 与实际量纲不符。 |
 | 菜单里根本没有这一项 | 插件加载失败,查 `crash.log`。 |

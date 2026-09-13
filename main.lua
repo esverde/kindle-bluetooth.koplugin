@@ -39,10 +39,6 @@ local function isNumberInRange(value, minimum, maximum)
     return type(value) == "number" and value >= minimum and value <= maximum
 end
 
-local function isDevicePath(path)
-    return type(path) == "string" and path:match("^/dev/input/event%d+$") ~= nil
-end
-
 -- 必须判 nil：用 `or` 会把 false 覆盖值吃掉（docs §10）
 local function override(settings, key, from_file)
     local saved = settings:readSetting(key)
@@ -70,6 +66,8 @@ function BluetoothController:init()
     self:openDevice(false)
 end
 
+-- bluetooth.lua 返回配置数组，每份对应一个手柄。真正生效的那份由
+-- resolveProfile 按「哪个手柄现在在线」决定（docs §16）
 function BluetoothController:loadSettings()
     local loader = loadfile(self.path .. "/bluetooth.lua")
     if not loader then
@@ -77,19 +75,40 @@ function BluetoothController:loadSettings()
         return false
     end
 
-    local ok, file_config = pcall(loader)
-    if not ok or type(file_config) ~= "table" then
-        logger.warn("BT Plugin: Failed to evaluate config file")
+    local ok, profiles = pcall(loader)
+    if not ok or type(profiles) ~= "table" or type(profiles[1]) ~= "table" then
+        logger.warn("BT Plugin: bluetooth.lua is not a profile list")
         return false
     end
 
-    return self:applyConfig(file_config)
+    self.profiles = profiles
+    self._active_profile = nil
+    return true
+end
+
+-- 按配置顺序取第一个能匹配到在线设备的那份。两个手柄都开着时，数组里靠前的赢
+function BluetoothController:resolveProfile()
+    if not self.profiles then return nil end
+    local devices = self:scanJoystickDevices()
+    for _i, profile in ipairs(self.profiles) do
+        if type(profile.match_name) == "string" then
+            for _j, dev in ipairs(devices) do
+                -- 手写的模式串可能非法（比如落单的 %），pcall 住免得崩掉整个插件
+                local ok, hit = pcall(string.match, dev.name, profile.match_name)
+                if not ok then
+                    logger.warn("BT Plugin: bad match_name pattern: " .. profile.match_name)
+                elseif hit then
+                    return profile, dev.path
+                end
+            end
+        end
+    end
 end
 
 -- 唯一的校验点：全部必填，一项不过关整份拒绝，不加兜底（docs §10）
 function BluetoothController:applyConfig(cfg)
     local checks = {
-        { "device_path",         isDevicePath(cfg.device_path) },
+        { "match_name",          type(cfg.match_name) == "string" and cfg.match_name ~= "" },
         { "display_name",        type(cfg.display_name) == "string" and cfg.display_name ~= "" },
         { "trigger_cooldown_ms", isNumberInRange(cfg.trigger_cooldown_ms, 0, 60000) },
         { "axis_threshold",      isNumberInRange(cfg.axis_threshold, 0, 65535) },
@@ -121,13 +140,15 @@ function BluetoothController:applyConfig(cfg)
     for k, v in pairs(cfg) do
         self.config[k] = v
     end
-    self.config.invert_layout = override(self.settings, "invert_layout", cfg.invert_layout)
+    -- 覆盖值按 match_name 分桶：两个手柄的「反转方向」互不影响（docs §16）
+    self.config.invert_layout =
+        override(self.settings, cfg.match_name .. "/invert_layout", cfg.invert_layout)
     -- 没有十字键就锁死摇杆模式，忽略覆盖值：否则一份陈旧的 use_analog_mode = false
     -- 会配上一个不发 HAT 事件的手柄，变成完全不能翻页且菜单里改不回来（docs §11）
     self.config.use_analog_mode = not cfg.supports_dpad
-        or override(self.settings, "use_analog_mode", cfg.use_analog_mode)
+        or override(self.settings, cfg.match_name .. "/use_analog_mode", cfg.use_analog_mode)
     resetInputState()
-    logger.info("BT Plugin: Loaded config for " .. cfg.device_path)
+    logger.info("BT Plugin: Using profile " .. cfg.display_name)
     return true
 end
 
@@ -210,26 +231,19 @@ local function getFBInkInput()
     return _fbink_input, _fbink_input_masks
 end
 
-local function isControllerDevice(path)
-    -- 先判存在：节点不在时 FBInk 会往 stderr 打一行错误（docs §1）
-    if lfs.attributes(path, "mode") == nil then return false end
-
-    local library, masks = getFBInkInput()
-    if not library then return false end
-
-    local device = library.fbink_input_check(path, masks.match, masks.exclude, masks.settings)
-    if device == nil then return false end
-
-    local matched = device.matched
-    C.free(device)
-    return matched
-end
-
 function BluetoothController:openDevice(is_reload)
-    local path = self.config.device_path
-    if not isDevicePath(path) then
-        logger.warn("BT Plugin: Invalid device path")
+    -- 路径来自扫描而非配置：scanJoystickDevices 只列已被 FBInk 判定为手柄的节点，
+    -- 所以不必再单独 isControllerDevice 一次（docs §16）
+    local profile, path = self:resolveProfile()
+    if not profile then
+        logger.info("BT Plugin: No configured controller is present")
+        self:closeDevice()
         return false
+    end
+
+    if profile ~= self._active_profile then
+        if not self:applyConfig(profile) then return false end
+        self._active_profile = profile
     end
 
     if self.opened_path and self.opened_path ~= path
@@ -237,15 +251,7 @@ function BluetoothController:openDevice(is_reload)
         return false
     end
 
-    local usable = isControllerDevice(path)
-
-    if self:isDeviceOpened(path) and (is_reload or not usable)
-        and not self:closeDevice(path) then
-        return false
-    end
-
-    if not usable then
-        logger.info("BT Plugin: Device " .. path .. " unavailable or not a supported controller")
+    if is_reload and self:isDeviceOpened(path) and not self:closeDevice(path) then
         return false
     end
 
@@ -357,22 +363,25 @@ local function fetchBatteryLevel(device_path)
 end
 
 function BluetoothController:readBatteryLevel()
-    if not self:isDaemonRunning() then return nil end
+    if not self.opened_path or not self:isDaemonRunning() then return nil end
 
-    local ok, level = pcall(fetchBatteryLevel, self.config.device_path)
+    local ok, level = pcall(fetchBatteryLevel, self.opened_path)
     if ok then return level end
     logger.dbg("BT Plugin: battery read failed: " .. tostring(level))
 end
 
+-- 只在真正从「没开」变成「开了」时才提示：insert 事件对任何输入设备都会来，
+-- 不加这个判断会在触屏等无关节点插入时弹出误导性的提示
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
-    if self:openDevice(true) then
-        UIManager:show(InfoMessage:new{ text = _("手柄已重新连接"), timeout = 2 })
+    local was_open = self.opened_path ~= nil
+    if self:openDevice(false) and not was_open then
+        UIManager:show(InfoMessage:new{ text = _("手柄已连接"), timeout = 2 })
     end
 end
 
+-- 不比对路径：节点号由解析决定，插进来的这个可能正是要用的那个
 function BluetoothController:onEvdevInputInsert(path)
-    if path ~= self.config.device_path then return end
     logger.info("BT Plugin: Input device inserted: " .. path)
     UIManager:unschedule(self._reconnect)
     UIManager:scheduleIn(RECONNECT_SETTLE_DELAY, self._reconnect, self)
@@ -502,10 +511,10 @@ function BluetoothController:addToMainMenu(menu_items)
 
             local items = {}
             for _i, dev in ipairs(devices) do
-                local is_configured = dev.path == self.config.device_path
-                local tag = DEVICE_TAGS[is_configured][dev.opened]
-                local name = is_configured and self.config.display_name or dev.name
-                local level = is_configured and self:readBatteryLevel()
+                local is_active = dev.path == self.opened_path
+                local tag = DEVICE_TAGS[is_active][dev.opened]
+                local name = is_active and self.config.display_name or dev.name
+                local level = is_active and self:readBatteryLevel()
                 local pct = level and string.format(" %d%%", level) or ""
                 table.insert(items, { text = name .. pct .. tag })
             end
@@ -513,13 +522,20 @@ function BluetoothController:addToMainMenu(menu_items)
         end,
     })
 
+    -- 覆盖值按 match_name 分桶；没有生效的配置时这两项无处可写，故灰显
+    local function saveOverride(key, value)
+        self.settings:saveSetting(self.config.match_name .. "/" .. key, value)
+        self.settings:flush()
+    end
+    local function hasProfile() return self.config.match_name ~= nil end
+
     table.insert(sub_items, {
         text = _("反转方向"),
+        enabled_func = hasProfile,
         checked_func = function() return self.config.invert_layout end,
         callback = function()
             self.config.invert_layout = not self.config.invert_layout
-            self.settings:saveSetting("invert_layout", self.config.invert_layout)
-            self.settings:flush()
+            saveOverride("invert_layout", self.config.invert_layout)
         end
     })
 
@@ -532,15 +548,14 @@ function BluetoothController:addToMainMenu(menu_items)
             callback = function()
                 self.config.use_analog_mode = analog
                 resetInputState()
-                self.settings:saveSetting("use_analog_mode", analog)
-                self.settings:flush()
+                saveOverride("use_analog_mode", analog)
             end,
         }
     end
 
     table.insert(sub_items, {
         text = _("摇杆模式"),
-        enabled_func = function() return self.config.supports_dpad end,
+        enabled_func = function() return hasProfile() and self.config.supports_dpad end,
         sub_item_table = {
             modeItem(_("模拟摇杆"), true),
             modeItem(_("方向键"), false),
