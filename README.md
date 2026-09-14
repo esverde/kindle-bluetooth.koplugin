@@ -27,6 +27,7 @@ Kindle awake while you read.
 - [Finding your controller's values](#finding-your-controllers-values)
 - [Troubleshooting](#troubleshooting)
 - [Branches](#branches)
+- [License](#license)
 - [Credits](#credits)
 
 ---
@@ -418,6 +419,12 @@ tail -40 /mnt/us/koreader/plugins/bluetooth.koplugin/khp/hid_passthrough.log
 
 `docs/NOTES.md` holds maintainer notes: measured facts, rejected designs and
 the reasoning behind non-obvious code. It is a working log, not documentation.
+
+## License
+
+[GNU AGPL v3 or later](LICENSE), matching KOReader itself. In short: you may use,
+modify and redistribute this plugin, but derivative works must stay under the
+same licence and ship their source.
 
 ## Credits
 

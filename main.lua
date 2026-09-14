@@ -1,3 +1,7 @@
+-- Bluetooth Page Turner for Kindle - a KOReader plugin
+-- Copyright (C) 2026  esverde
+-- Licensed under the GNU AGPL v3 or later; see LICENSE for the full text.
+
 local DataStorage = require("datastorage")
 local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
