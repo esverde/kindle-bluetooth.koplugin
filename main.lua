@@ -63,7 +63,7 @@ function BluetoothController:init()
     self.ui.menu:registerToMainMenu(self)
     self:registerInputHook()
     self:installWifiGuard()
-    self:openDevice(false)
+    self:openDevice()
 end
 
 -- bluetooth.lua 返回配置数组，每份对应一个手柄。真正生效的那份由
@@ -231,7 +231,7 @@ local function getFBInkInput()
     return _fbink_input, _fbink_input_masks
 end
 
-function BluetoothController:openDevice(is_reload)
+function BluetoothController:openDevice()
     -- 路径来自扫描而非配置：scanJoystickDevices 只列已被 FBInk 判定为手柄的节点，
     -- 所以不必再单独 isControllerDevice 一次（docs §16）
     local profile, path = self:resolveProfile()
@@ -248,10 +248,6 @@ function BluetoothController:openDevice(is_reload)
 
     if self.opened_path and self.opened_path ~= path
         and not self:closeDevice(self.opened_path) then
-        return false
-    end
-
-    if is_reload and self:isDeviceOpened(path) and not self:closeDevice(path) then
         return false
     end
 
@@ -311,9 +307,9 @@ function BluetoothController:scanJoystickDevices()
         if device.matched then
             local name = ffi.string(device.name)
             local path = ffi.string(device.path)
-            local is_opened = self:isDeviceOpened(path)
-            table.insert(devices, { path = path, name = name, opened = is_opened })
-            logger.info("BT Plugin: Found input device: " .. name .. " at " .. path .. " (opened=" .. tostring(is_opened) .. ")")
+            table.insert(devices, { path = path, name = name })
+            -- dbg 而非 info：resolveProfile 每次 evdev 插入都会扫一遍（docs §16）
+            logger.dbg("BT Plugin: Found input device: " .. name .. " at " .. path)
         end
     end
     C.free(found)
@@ -375,7 +371,7 @@ end
 function BluetoothController:_reconnect()
     if _current_active_controller ~= self then return end
     local was_open = self.opened_path ~= nil
-    if self:openDevice(false) and not was_open then
+    if self:openDevice() and not was_open then
         UIManager:show(InfoMessage:new{ text = _("手柄已连接"), timeout = 2 })
     end
 end
@@ -467,12 +463,6 @@ function BluetoothController:parseAnalogInput(ev)
     return ev.value < center and mapping.low_dir or mapping.high_dir
 end
 
--- [是否当前配置][是否已打开]
-local DEVICE_TAGS = {
-    [true]  = { [true] = _(" [当前]"),   [false] = _(" [已配置]") },
-    [false] = { [true] = _(" [已连接]"), [false] = _(" [可用]") },
-}
-
 function BluetoothController:addToMainMenu(menu_items)
     local sub_items = {}
 
@@ -512,11 +502,12 @@ function BluetoothController:addToMainMenu(menu_items)
             local items = {}
             for _i, dev in ipairs(devices) do
                 local is_active = dev.path == self.opened_path
-                local tag = DEVICE_TAGS[is_active][dev.opened]
                 local name = is_active and self.config.display_name or dev.name
                 local level = is_active and self:readBatteryLevel()
                 local pct = level and string.format(" %d%%", level) or ""
-                table.insert(items, { text = name .. pct .. tag })
+                table.insert(items, {
+                    text = name .. pct .. (is_active and _(" [当前]") or _(" [可用]")),
+                })
             end
             return items
         end,
@@ -567,7 +558,7 @@ function BluetoothController:addToMainMenu(menu_items)
         callback = function()
             UIManager:show(InfoMessage:new{
                 text = not self:loadSettings() and _("配置加载失败")
-                    or self:openDevice(true) and _("设备已加载")
+                    or self:openDevice() and _("设备已加载")
                     or _("加载失败"),
                 timeout = 2,
             })

@@ -27,24 +27,8 @@
 
 ## 配置文件
 
-配置文件为插件目录下的 `bluetooth.lua`，**单手柄、扁平结构、无多 profile**。
-
-| 字段 | 说明 |
-| --- | --- |
-| `device_path` | 手柄对应的 Linux 输入节点，例如 `/dev/input/event2`。 |
-| `display_name` | 「已连接设备」菜单里显示的名字，非空字符串。**只替换本机配置那一台**；扫到的其他节点仍显示 evdev 原名，方便认节点。原名带 khp 生成的 MAC 后缀，很长。 |
-| `trigger_cooldown_ms` | 两次翻页触发之间的最小间隔，单位为毫秒（0~60000）。 |
-| `invert_layout` | 是否反转上一页/下一页方向。**本分支唯一可被菜单覆盖的项**。 |
-| `axis_threshold` | 模拟轴死区阈值（0~65535）。本分支为 `95`（行程 ±127）。 |
-| `analog_center` | 模拟轴中心值，`analog_map` 里出现的每个轴码都必须有一项。本分支为 `0`。 |
-| `key_map` | 按键码到翻页方向的映射；正数为下一页，负数为上一页。 |
-| `analog_map` | 模拟轴映射；轴码 0/1，分别表示 X/Y 轴。 |
-
-> 主分支还有 `supports_dpad` / `use_analog_mode` / `dpad_map` 三项，用于在菜单里
-> 切换摇杆/方向键模式。**本分支没有** —— 黑鲨手柄只有摇杆 + 四个面键 + 两个
-> 肩键，没有十字键，那条模式切换在这台机器上是不可达的死路径（§11）。
-
-改完配置后用菜单「重新加载设备」生效，插件会先释放旧节点再打开新节点。
+**字段含义与示例见仓库根目录的 README**，这里只记它背后的规则。结构是**配置数组**，
+生效的那份按设备名解析（§16）。
 
 ### 没有兜底：字段缺失或越界一律拒绝
 
@@ -55,11 +39,11 @@
 
 校验通过之后，输入热路径直接索引这些字段，不再逐个判类型（docs §9）。
 
-**查真实节点号**：菜单「已连接设备」只显示名称与状态标签，节点号看 `crash.log`：
+**查真实节点号**：菜单「已连接设备」只显示名称与状态标签。节点号现在**不需要**填进
+配置（§16），排错时看日志 —— 注意这行是 `logger.dbg`，要开 debug 才有：
 
 ```sh
 grep "Found input device" /mnt/us/koreader/crash.log
-# BT Plugin: Found input device: 黑鲨双翼手柄L-XXXX at /dev/input/event3 (opened=true)
 ```
 
 **`bluetooth.lua` 是只读的**，插件永不改写它，注释和格式随你怎么写。
@@ -387,7 +371,7 @@ if ok or err == C.ENODEV then
 | `startDaemon` 先 `lfs.attributes` 判存在 | `khp/` 在 `.gitignore` 里，「新克隆后守护进程二进制不存在」是最可能的实际场景。少了这一判，`setsid` 会静默失败，症状退化成「点了没反应」 |
 | `opened_fd` 字段 | 开设备时记下 fd，输入热路径上省一次表查。每次 open 后必须重读 —— 实测同一手柄在不同会话里拿到过 13 和 16 |
 | `handleInputEvent` 的 fd 闸门 | 只认手柄那一个 fd，触屏事件在此被挡住，所以不需要额外的 `ABS_MT`（轴码 ≥ 47）预过滤。保留 `not self.opened_fd or` 判空是因为无法证明不存在 `ev.fd == nil` 的事件路径 |
-| `closeDevice` 无参调用 | 只关自己开过的节点（回退到 `opened_path`，不回退到 `config.device_path`），别去动别人的 fd |
+| `closeDevice` 无参调用 | 只关自己开过的节点（回退到 `opened_path`），别去动别人的 fd |
 | `onEvdevInputInsert` 里先 `unschedule` | 快速插拔时才不会堆叠出多个重连任务 |
 | `onEvdevInputRemove` 立刻关闭 | 节点消失就放掉 fd，不必等下一次 `openDevice` 去发现它已经死了 |
 | `axis_threshold` / `trigger_cooldown_ms` 直接读 `self.config` | 两者都是**必填无默认**（`applyConfig` 的 checks 表），校验过了热路径才敢直接索引 |
@@ -520,74 +504,10 @@ characteristic，**没有任何翻页逻辑**；`turnkey` 的输入设备只实�
 **射频归 khp，插件只读 evdev。** 插件不碰蓝牙状态（§6），不实现 GATT，
 不加载任何 `.so`。终点和主分支一样是 evdev，所以 §1–§5、§7–§10 全部适用。
 
-### 守护进程：手动剪裁安装
+### 守护进程：安装与配置
 
-版本钉在 **v3.15.2 / `BUILD_SHA = 202ef78`**（`dist/kindle_hid_passthrough/BUILD_SHA`）。
-守护进程本体**不进本仓库** —— 21M 三方二进制进 git 历史是永久成本，而且上游在活跃
-修变砖级 bug（PR #230 修 `install.sh` 把 `/` 留在读写挂载、PR #246 修 btd 被 SIGSTOP
-后再也解冻不了），钉死版本会让这些修复静默到不了手上。这个仓库还为此死过一次：
-`4adbeaf` 里的 `libkindlebt_adapter.so` 与它的 `adapter.c` 符号名已经对不上。
-
-**整个目录可迁移，不需要任何环境变量；但 `config.ini` 里的绝对路径必须改。**
-
-- **启动器**（ARM 静态 ELF）用 `/proc/self/exe` + `readlink` 定位自己，再按相对路径
-  加载 `dist/ld-linux-armhf.so.3` 和 `dist/main.bin`。里面**没有任何 `/mnt/us` 硬编码**。
-- **base path** 由 `Config._determine_base_path` 解析，顺序是
-  `os.environ["KINDLE_HID_BASE"]` → **exe 所在目录** → 硬编码默认值
-  `/mnt/us/kindle_hid_passthrough`。实测从 `khp/` 直接跑（不设任何环境变量）
-  就打出 `Config base path: /mnt/us/koreader/plugins/bluetooth.koplugin/khp`
-  —— 所以 `KINDLE_HID_BASE` 是可用的覆盖手段，但迁移**用不到**它。
-  （另有 `KINDLE_HID_DEBUG` 可用于排错。`--help` 里没有对应的命令行开关。）
-- **但 `config.ini` 内部两条是绝对路径**，base path 变了它们不会跟着变：
-
-  ```ini
-  cache_dir      = <base>/cache
-  devices_config = <base>/devices.conf
-  ```
-
-  不改的症状是**静默用旧目录**（日志里 `Using device from
-  /mnt/us/kindle_hid_passthrough/devices.conf: …`），此时删旧目录就断。迁移时：
-
-  ```sh
-  cp -a /mnt/us/kindle_hid_passthrough/cache /mnt/us/kindle_hid_passthrough/devices.conf .
-  sed -i 's#/mnt/us/kindle_hid_passthrough#'"$PWD"'#g' config.ini
-  ```
-
-所以全部放一处即可：
-
-| 位置 | 内容 | 大小 |
-| --- | --- | --- |
-| `<插件目录>/khp/` | `kindle-hid-passthrough`（**必须 `chmod +x`**）、`libsyscall_wrapper.so`、`dist/`、`config.ini`、`cache/`、`devices.conf` | 18.7M |
-
-> `dist/kindle_hid_passthrough/config.ini`（661B）**保留**。`_module_search_dirs`
-> 证明 `<base>/dist/kindle_hid_passthrough/` 是打包资源查找目录（`modules/` 也在
-> 那儿），那份 config 可能是 freeze 时带进来的默认值，也可能是 fallback ——
-> 从二进制里分不出来。为省 661 字节去赌一个未知不值得。
-
-从 release 包里**丢弃**这些（21M → 18.7M）：
-
-| 丢弃 | 大小 | 理由 |
-| --- | --- | --- |
-| `dist/kindle_hid_passthrough/modules/` | 1.3M | 三类预编译模块，两个用途都跟本分支无关：8 个 `uhid-*.ko`（内核 3.0.35 / 3.10.53 / 4.1.15，板名 duet / heisenberg / rex / zelda）是给 8–10 代**内核没编 `CONFIG_UHID`** 的机器补的 —— PW6 内核 5.15.41 原生支持（`--diagnostics` 里 `/dev/uhid: True`、`/sys/bus/hid: True`）；2 个 `uinput-*.ko` 加 1 个 `hid-*.ko` 是给 button-mapper 之类外部工具注入按键用的 —— 我们不用 |
-| `button-mapper/` | 878K | 上游 boot loop 成因之一，见下 |
-| `koreader-plugin/` | 201K | 与本插件功能重叠（也做按键→动作映射），且它的 KOReader 动作需要开 HTTP Inspector |
-| `illusion/` | 88K | WAF app 相关 |
-| `assets/` | 6K | udev 规则 / upstart / WAF `config.xml`，三样都不装 |
-| `scripts/` | 60K | `hid-passthrough-daemon.sh` 的路径按 `/mnt/us/kindle_hid_passthrough` 写死，挪目录就不对；开关由插件自己做 |
-
-```sh
-cd /mnt/us/koreader/plugins/bluetooth.koplugin/khp
-chmod +x kindle-hid-passthrough
-setsid ./kindle-hid-passthrough --daemon > /dev/null 2>&1 < /dev/null &
-sleep 8 && grep -E "Keystore|Serving devices" /var/log/hid_passthrough.log | tail -4
-```
-
-期待 `Serving devices (Classic: 0, BLE: 1)`。确认迁移是否彻底则**直接看文件**，
-不用重启守护进程：
-
-```sh
-grep -A3 '\[paths\]' config.ini && ls -l devices.conf && ls cache/
-```
+目录结构、剪裁范围、`config.ini` 模板与「迁移时必须自己处理的三件事」全部写在
+**README 的安装一节**，这里不重复。下面只记安装过程中查证过、README 放不下的东西。
 
 ### 排错：三个会误导人的现象
 
@@ -615,47 +535,7 @@ API 端口 8321 被占。先 `pkill -f ld-linux-armhf`。
 → `--diagnostics`。注意 `--diagnostics` **不打** `Config base path`，而且它那段
 `===== Daemon log tail =====` 是历史日志，别拿来当当前状态读。
 
-### config.ini：只记本机的偏离
-
-各配置项的字面含义看上游出厂 `config.ini` 的注释，这里只记**迁移到插件目录后
-必须自己处理的三件事**。每个键都有默认值，所以整份文件都是可选的。
-
-最小可用：
-
-```ini
-[paths]
-cache_dir = <khp>/cache
-devices_config = <khp>/devices.conf
-
-[connection]
-reconnect_delay = 5
-hci_reset_timeout = 10
-connect_timeout = 30
-transport_timeout = 30
-
-[media_remote]
-enabled = false
-
-[logging]
-log_file = <khp>/hid_passthrough.log
-```
-
-**1. `[paths]` 两条务必显式写。** base path 已是 `khp/` 目录，算出来的默认值和
-手写的一模一样，但迁移时最容易错的就是这两条 —— 本仓库为此排查了一整轮，症状是
-`Using device from /mnt/us/kindle_hid_passthrough/devices.conf`。显式写着一眼能看
-出要改什么；省略就变成隐式行为，得重新推一遍 base path 的解析顺序。
-
-**2. `log_file` 挪出 tmpfs 之后会一直增长。** `/var/log/` 是 tmpfs、重启即失；
-挪到 `/mnt/us` 就**重启不清**，而 khp 没有自带轮转，偶尔看一眼大小。排错时记得
-看新路径，别再 tail `/var/log/hid_passthrough.log`（那份不再更新）。
-
-**3. `[media_remote] enabled = false` 是唯一必须显式写的** —— 出厂值是 `true`，
-靠省略拿不到 `false`。理由见下。
-
-`[transport]` / `[device]` / `[protocol]` 三节都可以整节删掉：按机型自动探测，
-或只在 `devices.conf` 缺失时作单设备兜底。本机有 `devices.conf`，它们不生效。
-
-#### `[media_remote] enabled` 应改为 `false`
+### 为什么 `[media_remote] enabled` 必须显式写成 `false`
 
 这是「用手机音量键翻页」——把 Kindle 伪装成蓝牙音箱，手机连上来按音量键翻页。
 本插件不用它，而**开着它会让 Kindle 对外可被发现、可被连接**。
@@ -700,44 +580,6 @@ button-mapper，所以这条**必然出现且可以忽略**。
 
 约 0.6 秒的窗口，丢掉的是这期间的按键。**如果守护进程启动的那一两秒里你正好
 按着键，那次按下会丢** —— 除此之外无影响。
-
-### 不要装的三样（即使用官方安装器）
-
-| 跳过 | 理由 |
-| --- | --- |
-| WAF app（`installWAFApp`，option 6）/ Button Mapper（option 8） | 上游 boot loop 的成因。#226（PW6 5.19.5）与 #250（11 代）崩的都是 `mesquite` / `pillowd`，触发者是 BTManager 的 WAF scriptlet；变砖机制见 PR #230：`installAll` shell out 到 button-mapper 安装器，那个跑在 `set -e` 下可能在 `mntroot rw` 窗口里 abort，把 `/` 留在读写挂载，加上 `core_pattern` 是裸 `core` |
-| 开机自启（`installUpstart`，option 5） | 会一直占着射频（上游默认关闭，原文 *"leaves the Bluetooth radio free for audio"*） |
-| udev 规则（`installUdevRules`，option 4） | **对本手柄无效，装了也白装** —— 见下 |
-
-#### udev 规则为什么对本手柄无效
-
-`assets/99-hid-keyboard.rules` + `scripts/dev_is_keyboard.sh` 的作用是给**键盘**打
-`ID_INPUT_KEYBOARD` 标记，闸门是 **KEY_Q（bit 16）**：
-
-```sh
-LAST_WORD=$(cat "$CAPS/key" | tr ' ' '\n' | tail -1)
-Q_BIT=$(( 0x$LAST_WORD & 0x10000 ))
-```
-
-本手柄的 `B: KEY=6fdb0000 0 0 0 1000 40000800 c0000 0 0 0`，**最右一组（bit 0–31）
-是 `0`**，所以 `Q_BIT = 0`，不会被打标记。既不产生效果，就没有理由去改 `/etc`。
-
-> 曾经写过「装了这条规则会让 KOReader 也把手柄当键盘打开 → 双 fd → 翻两页」——
-> **那是错的**，前提不成立，因为手柄拿不到键盘标记。这个双 fd 隐患只在
-> 真配一个蓝牙键盘时才存在；那时候要用 khp 自带的 sysfs 版本，不要用网上流传的
-> `evtest` 版本（Kindle 上不一定有 `evtest`）。
-
-规则里另一行 `KERNEL=="uhid", MODE="0660", GROUP="bluetooth"` 是把 `/dev/uhid` 放权
-给 `bluetooth` 组；以 root 跑守护进程时用不上。
-
-`start()` 只用裸 `&`，没有 `nohup`/`setsid`，SSH 断开会跟着 SIGHUP 走 ——
-所以上面用 `setsid` 自己拉。**进程名是 `ld-linux-armhf.so.3` 而不是
-`kindle-hid-passthrough`**（跑在打包的动态加载器下），所以：
-
-```sh
-ps aux | grep 'ld-linux-armhf' | grep -v grep   # 查
-pkill -f ld-linux-armhf                          # 停
-```
 
 ### 实测数值
 
@@ -892,12 +734,12 @@ cat /dev/input/event3 | xxd | grep ' 0100 '
 | `has_joystick_axes_or_buttons` | `BTN_A \|\| BTN_TRIGGER \|\| BTN_1 \|\| ABS_RX \|\| …` | BTN_A(304) ✓、ABS_RX(3) ✓ | **is_joystick** |
 
 `exclude = INPUT_TOUCHSCREEN` 不会误命中：`has_mt_coordinates` 要
-ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` 返回 true，
+ABS_MT_POSITION_X/Y（53/54），位图里没有。所以它被判为手柄，
 `openDevice` 原样可用 —— **设备名是中文不影响**，分类只看能力位，不看名字。
 
 ### 已在真机验证
 
-- FBInk 分类命中 `JOYSTICK`，`isControllerDevice` 返回 true
+- FBInk 分类命中 `JOYSTICK`，节点出现在 `scanJoystickDevices` 的结果里
 - `Loaded config for /dev/input/event3` → `Opened device /dev/input/event3`
 - 「已连接设备」列出手柄，显示 `display_name` 与电量百分比
 - **摇杆翻页正常**（`GotoViewRel` 无日志，靠肉眼确认）—— 删掉模式切换、
@@ -921,39 +763,6 @@ ABS_MT_POSITION_X/Y（53/54），位图里没有。所以 `isControllerDevice` �
   `receiving HID reports` → `battery: 100%`
 
 **功能验证到此完整**，验证方法一节的菜单表每一项都点过。
-
-### 摇杆/方向键模式切换：本分支整个删掉了
-
-黑鲨手柄只有摇杆 + 四个面键 + 两个肩键，**没有十字键**，所以模式切换在这台
-机器上是不可达的死路径。删掉的东西：
-
-| 位置 | 删掉的 |
-| --- | --- |
-| `bluetooth.lua` | `supports_dpad`、`use_analog_mode`、`dpad_map` |
-| `applyConfig` | `dpad_map` 的类型校验、`supports_dpad` 与 `use_analog_mode` 两行赋值 |
-| `parseInputDirection` | `EV_ABS` 的二选一分支，直接走 `parseAnalogInput` |
-| `main.lua` | `parseDpadInput`、`joystickModeItem`、「摇杆模式」菜单项 |
-
-**留着它不是中性的，它是一个陷阱的来源。** `supports_dpad = false` 会让「摇杆
-模式」菜单项变灰，于是**若在 `supports_dpad` 还是 `true` 的那几个版本里误切过
-「方向键」**，覆盖值 `false` 已经落进 `<settings>/bluetooth_controller.lua`，
-而菜单已经灰了、切不回来 —— 症状是完全不翻页。删掉整条路径之后
-`use_analog_mode` 根本不再被读取，这个坑就**不可能发生**了
-（残留的旧覆盖值会被静默忽略，无需清理）。
-
-> 曾经的判断是「保留 dpad 代码，删了每次 `git merge main` 都要处理冲突」。
-> 那个权衡算错了：主分支的 dpad 代码是完成态、极少改动，冲突成本接近零；
-> 而保留它的代价是一个能把人锁死的 footgun。**merge 便利不值得用一个已知
-> 陷阱去换。**
-
-### `event3` 这个节点号会漂移
-
-已实测： 重新配对+重启守护进程后 sysfs 变成
-`uhid/0005:0000:0000.0002/input/input4` —— **`inputN` 单调递增（3 → 4），
-但 evdev handler 仍是 `event3`**，因为 `eventN` 会回收复用。所以只要 3 个内建
-节点（event0/1/2）不变、且不同时接第二个 HID 设备，手柄就稳定落在 event3。
-多接一个就会漂移。掉线重连本身由 `onEvdevInputInsert` 兜住（§2），
-但**换了节点号要改 `bluetooth.lua`**（节点号看 §「查真实节点号」）。
 
 ## §12 守护进程开关：为什么用信号而不是 HTTP API
 
@@ -1122,7 +931,7 @@ end
 }]
 ```
 
-`input_paths` 直接给出 evdev 节点，所以按 `device_path` 匹配即可 —— 那本来就是
+`input_paths` 直接给出 evdev 节点，所以拿 `opened_path` 匹配即可 —— 那本来就是
 本插件唯一认的设备身份（§9）。khp 自己的插件按 `address` 匹配，我们不需要多引入
 一个身份维度。
 
@@ -1635,10 +1444,9 @@ WiFi 守卫另测（§14）：起守护进程 → 连开两次 WiFi → 停守�
 
 | 日志 | 原因 |
 | --- | --- |
-| `FBInk input classifier is unavailable` / `Failed to load FBInk input classifier` | FBInk 输入库没加载。会导致 `isControllerDevice` 恒为 false，**任何设备都打不开** |
+| `FBInk input classifier is unavailable` / `Failed to load FBInk input classifier` | FBInk 输入库没加载。`scanJoystickDevices` 会返回空表，于是解析不出任何配置，**任何设备都打不开** |
 | `Device … unavailable or not a supported controller` | 节点不存在，或 FBInk 不认它是 JOYSTICK/DPAD。先做"扫描"一步拿真实节点号 |
-| `Invalid device path` | `device_path` 不符合 `/dev/input/eventN` 格式 |
 | `Failed to open … -> …` | 节点在但打不开，通常是权限或已被独占 |
 
-「已连接设备」菜单**不依赖 `device_path`**（`fbink_input_scan` 扫全部节点），
+「已连接设备」菜单列的是 `fbink_input_scan` 扫到的全部手柄节点，
 所以配置里节点号写错时，仍可用它查出正确的节点号。
