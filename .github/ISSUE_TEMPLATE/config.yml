@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Controller will not pair, or the daemon crashes
+    url: https://github.com/zampierilucas/kindle-hid-passthrough/issues
+    about: >-
+      Pairing, the Bluetooth link itself, and daemon crashes belong to
+      kindle-hid-passthrough. This plugin only reads the input device that khp
+      creates — if the controller never appears in /proc/bus/input/devices, the
+      problem is upstream.
+  - name: Wi-Fi stops working while the daemon runs
+    url: https://github.com/zampierilucas/kindle-hid-passthrough/issues/88
+    about: >-
+      Known and unfixable here — Wi-Fi and Bluetooth share one chip. See the
+      Wi-Fi section of the README for the working order of operations.

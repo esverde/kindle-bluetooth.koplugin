@@ -1,0 +1,95 @@
+name: Bug report
+description: Something does not work. 反馈一个问题。
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check the two most common causes:
+
+        1. **Was Wi-Fi connected when you started the daemon?** With Wi-Fi off the
+           controller never connects — see the Wi-Fi section of the README.
+        2. **Did the daemon actually start?** A second toast saying the controller
+           is connected should appear ~5 s after starting it.
+
+        > ⚠️ **Scrub your logs before pasting.** They contain your controller's
+        > Bluetooth address and your Kindle's firmware serial. Replace MAC
+        > addresses with `AA:BB:CC:DD:EE:FF` and firmware strings with
+        > `<redacted>`.
+
+  - type: dropdown
+    id: model
+    attributes:
+      label: Kindle model
+      options:
+        - Kindle Scribe
+        - Paperwhite (12th gen)
+        - Kindle (2024 / Basic 5)
+        - Other (state it in the description)
+    validations:
+      required: true
+
+  - type: input
+    id: koreader
+    attributes:
+      label: KOReader version
+      placeholder: "v2026.07.2"
+    validations:
+      required: true
+
+  - type: input
+    id: khp
+    attributes:
+      label: kindle-hid-passthrough version
+      description: "Run `./kindle-hid-passthrough --diagnostics`, or read `version` from the daemon status."
+      placeholder: "3.16.0"
+    validations:
+      required: true
+
+  - type: input
+    id: controller
+    attributes:
+      label: Controller
+      placeholder: "Xbox Wireless Controller"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wifi
+    attributes:
+      label: Was Wi-Fi connected when the daemon started?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: plugin_log
+    attributes:
+      label: Plugin log
+      description: "`grep 'BT Plugin' /mnt/us/koreader/crash.log | tail -40`"
+      render: text
+
+  - type: textarea
+    id: daemon_log
+    attributes:
+      label: Daemon log
+      description: "`tail -40 <plugin>/khp/hid_passthrough.log` — remember to redact addresses."
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Your bluetooth.lua
+      description: The profile that was supposed to be active.
+      render: lua
