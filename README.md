@@ -61,6 +61,11 @@ Kindle awake while you read.
 > **Why a jailbreak is unavoidable:** khp needs root to open `/dev/stpbt`, the
 > raw Bluetooth transport, and to create `/dev/uhid` devices.
 
+> **The plugin's own interface is Simplified Chinese only.** Menu entries and
+> toasts are not translated, and there is no `l10n/` catalogue yet. Menu items
+> are given below in English with the Chinese original alongside so you can find
+> them on screen. Pull requests adding translations are welcome.
+
 ## How it works
 
 ```
@@ -205,7 +210,7 @@ rejected and the reason is logged; there are no silent fallbacks.
 > menu once.** From then on the stored value wins and editing `bluetooth.lua`
 > has no effect on them. The other fields are always read from the file.
 
-After editing, use **Reload device** in the menu — no restart needed.
+After editing, use 重新加载设备 (*Reload device*) in the menu — no restart needed.
 
 ## Known controller profiles
 
@@ -289,19 +294,20 @@ as a starting point and verify with the method below.
 
 ## Menu reference
 
-**Settings → Network → Bluetooth Page Turner**
+**Settings → Network → 蓝牙翻页器** (Bluetooth Page Turner)
 
 | Item | What it does |
 | --- | --- |
-| **Bluetooth daemon** | Start or stop khp. Checked when it is running. |
-| **Connected devices** | Lists every gamepad-like input device found, with the configured one tagged and its battery level shown. |
-| **Invert direction** | Swap previous and next. Persists across restarts. |
-| **Stick mode** | Choose stick or D-pad. Greyed out when the controller has no D-pad. |
-| **Reload device** | Re-read `bluetooth.lua` and reopen the input device. |
+| 蓝牙守护进程 — *Bluetooth daemon* | Start or stop khp. Checked when it is running. |
+| 已连接设备 — *Connected devices* | Lists every gamepad-like input device found, with the active one tagged `[当前]` and its battery level shown. |
+| 反转方向 — *Invert direction* | Swap previous and next. Persists across restarts. |
+| 摇杆模式 — *Stick mode* | Choose 模拟摇杆 (stick) or 方向键 (D-pad). Greyed out when the controller has no D-pad. |
+| 重新加载设备 — *Reload device* | Re-read `bluetooth.lua` and reopen the input device. |
 
-When you start the daemon you will see *"Starting daemon…"*, and roughly five
-seconds later *"Controller reconnected"*. **If the second message never appears,
-the controller did not connect** — the usual cause is Wi-Fi being off.
+When you start the daemon a toast says the daemon is starting, and roughly five
+seconds later a second one says the controller is connected. **If that second
+message never appears, the controller did not connect** — the usual cause is
+Wi-Fi being off.
 
 ## Important: Wi-Fi and Bluetooth share one chip
 
@@ -324,7 +330,7 @@ Bringing Wi-Fi up while khp holds the chip leaves the radio in a state that
 Kindle.
 
 The plugin guards against this: attempting to enable Wi-Fi while the daemon is
-running shows *"Stop the Bluetooth daemon before enabling Wi-Fi"* and the request
+running shows 请先关闭蓝牙守护进程，再开 WiFi (*stop the Bluetooth daemon first*) and the request
 is refused. Stop the daemon from the menu, then turn Wi-Fi on normally.
 
 > **The guard cannot cover everything.** It only sees Wi-Fi changes made through

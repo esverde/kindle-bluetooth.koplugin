@@ -229,8 +229,7 @@ with an evdev device node… We intentionally don't filter on devpath"。
 
 早先有一个"唤醒后按 `wakeup_delay` 秒定时重连"的兜底，实测证明它无用且有害：
 
-- 情形 A：手柄没断，那次 close+reopen 纯属浪费，还会弹一个多余的
-  「手柄已重新连接」提示。
+- 情形 A：手柄没断，那次 close+reopen 纯属浪费，还会多弹一条重连提示。
 - 情形 B 周期 1：定时任务在 +3 秒跑，此时节点尚未创建 → 失败，
   并在日志里留下 `[FBInk] [fbink_input_check] open ...: No such file or directory!` 噪音。
 - 情形 B 周期 2：insert 事件在 +1 秒先到，`unschedule` 把定时任务直接取消 → 从未执行。
@@ -841,7 +840,7 @@ util.shell_escape({ self.path .. "/khp/dist/main.bin" })
 
 | 动作 | 已经存在的反馈 |
 | --- | --- |
-| 起 | 节点出现 → `onEvdevInputInsert` → `_reconnect` 弹**「手柄已重新连接」** |
+| 起 | 节点出现 → `onEvdevInputInsert` → `_reconnect` 弹**「手柄已连接」** |
 | 停 | 节点**同一秒**消失，手柄当场失效 —— 这就是「停了」对用户的全部含义 |
 
 而它带来的是一个真 bug：停止的回查排在 **+1s**，此时进程往往还在退出中
@@ -1037,8 +1036,9 @@ BT 芯片，而那段代码是整个项目最脆弱的部分，为一个边缘�
 
 > **先把 WiFi 连好，再起守护进程；读书期间不动 WiFi。**
 
-真要中途开关 WiFi，就先在菜单里关掉「蓝牙守护进程」，等提示「守护进程已停止」
-之后再动。
+真要中途开关 WiFi，就先在菜单里关掉「蓝牙守护进程」。**没有「已停止」这类回查
+提示**（那套延时回查整段删掉了，理由见 §12）；判据是手柄当场失效，以及重开菜单时
+勾选已消失。
 
 #### 「稳定共存没问题」的三条证据
 
@@ -1423,7 +1423,7 @@ cp -r /mnt/us/kbt-backup /mnt/us/koreader/plugins/kindle-bluetooth.koplugin
 
 | 菜单项 | 期待日志 | 另外确认 |
 | --- | --- | --- |
-| 蓝牙守护进程 → 开 | `khp daemon start requested` → 约 5s 后 `Input device inserted` → `Opened device` | 提示「正在启动…」，随后「手柄已重新连接」。**没有第二条就是没连上**（多半 WiFi 关着，见 §12） |
+| 蓝牙守护进程 → 开 | `khp daemon start requested` → 约 5s 后 `Input device inserted` → `Opened device` | 提示「正在启动守护进程…」，随后「手柄已连接」。**没有第二条就是没连上**（多半 WiFi 关着，见 §12） |
 | 蓝牙守护进程 → 关 | `khp daemon stop requested` → 同一秒 `Input device removed` → `Closing device` | 手柄当场失效；`ko-input` 打出 `Closed input device with fd: N` |
 | 已连接设备 | `Found input device: …` | 只列手柄；显示 `display_name` + 电量百分比 |
 | 反转方向 | 设置文件出现 `invert_layout` | **重启后仍然反转** |
