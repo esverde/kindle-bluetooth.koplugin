@@ -220,73 +220,16 @@ profiles**; an 8-bit stick and a 16-bit stick differ by a factor of 256, and
 getting it wrong means either "nothing happens" or "it flips pages when I
 breathe on it".
 
-Both examples below are entries in the same array — keep the ones you use and
-delete the rest.
+The shipped [`bluetooth.lua`](bluetooth.lua) **is** the reference: it is a
+working, annotated array with the two profiles below, and it is the file the
+plugin actually loads. Open it, keep the entry that matches your controller,
+delete the rest, and add your own using
+[Finding your controller's values](#finding-your-controllers-values).
 
-### Controller with stick and buttons, no D-pad
-
-8-bit signed axes, centre `0`, full travel `±127`:
-
-```lua
-{
-    match_name = "My Pad",
-    display_name = "My Controller",
-    trigger_cooldown_ms = 500,
-
-    invert_layout = false,
-    supports_dpad = false,
-
-    axis_threshold = 95,
-    analog_center = { [0] = 0, [1] = 0 },
-
-    -- 1 = next page, -1 = previous page
-    key_map = {
-        [304] = 1,  [305] = 1,  [310] = 1,    -- A / B / L1
-        [307] = -1, [308] = -1, [312] = -1,   -- X / Y / L2
-    },
-
-    analog_map = {
-        [1] = { low_dir = -1, high_dir = 1 }, -- ABS_Y
-        [0] = { low_dir = -1, high_dir = 1 }, -- ABS_X
-    },
-},
-```
-
-### Xbox Wireless Controller
-
-16-bit axes, centre `32768`. **These values come from the same controller used
-over classic Bluetooth and have not yet been re-measured over BLE** — treat them
-as a starting point and verify with the method below.
-
-```lua
-{
-    match_name = "Xbox",
-    display_name = "Xbox Controller",
-    trigger_cooldown_ms = 500,
-
-    invert_layout = false,
-    use_analog_mode = true,
-    supports_dpad = true,
-
-    axis_threshold = 16384,
-    analog_center = { [0] = 32768, [1] = 32768 },
-
-    key_map = {
-        [304] = -1, [307] = -1,   -- A / X
-        [305] = 1,  [308] = 1,    -- B / Y
-    },
-
-    dpad_map = {
-        [17] = { [-1] = 1,  [1] = -1 },   -- ABS_HAT0Y
-        [16] = { [-1] = -1, [1] = 1 },    -- ABS_HAT0X
-    },
-
-    analog_map = {
-        [1] = { low_dir = 1,  high_dir = -1 },
-        [0] = { low_dir = -1, high_dir = 1 },
-    },
-},
-```
+| Entry | Axes | D-pad | Status |
+| --- | --- | --- | --- |
+| Stick-and-buttons pad, no D-pad | 8-bit signed, centre `0`, travel `±127` | no | measured over BLE |
+| Xbox Wireless Controller | 16-bit, centre `32768` | yes | **carried over from classic Bluetooth, not yet re-measured over BLE** — a starting point, verify it |
 
 > **Only one controller is used at a time.** If both are switched on, both
 > connect at the khp level, but the plugin reads input from the first matching

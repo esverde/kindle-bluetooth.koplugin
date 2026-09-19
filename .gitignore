@@ -11,20 +11,3 @@ koreader-base/
 *.log
 log/
 test/
-
-# 编辑器与系统垃圾
-.vscode/
-.idea/
-.DS_Store
-*.sublime-workspace
-*.sublime-project
-
-# AI 客户端
-CLAUDE.md
-AGENTS.md
-GEMINI.md
-.claude/
-.gemini/
-.qwen/
-.openai/
-.codegraph/

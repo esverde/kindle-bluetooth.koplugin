@@ -317,8 +317,6 @@ function BluetoothController:scanJoystickDevices()
         end
     end
     C.free(found)
-
-    table.sort(devices, function(left, right) return left.path < right.path end)
     return devices
 end
 
@@ -343,29 +341,24 @@ function BluetoothController:stopDaemon()
     logger.info("BT Plugin: khp daemon stop requested")
 end
 
--- 电量只能从 khp 的 API 拿：evdev 不带这个信息，内核也没建 hid 电量节点（docs §13）
-local BATTERY_CMD = "wget -qO- -T 2 http://127.0.0.1:8321/status 2>/dev/null"
-
--- 整个函数在 pcall 里跑：popen 失败、连不上、API 换结构一律当「没有电量」
-local function fetchBatteryLevel(device_path)
-    local pipe = io.popen(BATTERY_CMD)
-    local body = pipe:read("*all")
-    pipe:close()
-
-    for _i, conn in ipairs(require("rapidjson").decode(body).connections) do
-        for _j, path in ipairs(conn.input_paths) do
-            if path == device_path then
-                -- JSON null 被解成 rapidjson.null（userdata），不是 nil
-                return type(conn.battery_level) == "number" and conn.battery_level
-            end
-        end
-    end
-end
-
+-- 电量只能从 khp 的 API 拿：evdev 不带这个信息，内核也没建 hid 电量节点（docs §13）。
+-- 取值整段在 pcall 里跑：popen 失败、连不上、API 换结构一律当「没有电量」
 function BluetoothController:readBatteryLevel()
     if not self.opened_path or not self:isDaemonRunning() then return nil end
 
-    local ok, level = pcall(fetchBatteryLevel, self.opened_path)
+    local ok, level = pcall(function()
+        local pipe = io.popen("wget -qO- -T 2 http://127.0.0.1:8321/status 2>/dev/null")
+        local body = pipe:read("*all")
+        pipe:close()
+        for _i, conn in ipairs(require("rapidjson").decode(body).connections) do
+            for _j, path in ipairs(conn.input_paths) do
+                if path == self.opened_path then
+                    -- JSON null 被解成 rapidjson.null（userdata），不是 nil
+                    return type(conn.battery_level) == "number" and conn.battery_level
+                end
+            end
+        end
+    end)
     if ok then return level end
     logger.dbg("BT Plugin: battery read failed: " .. tostring(level))
 end
@@ -394,21 +387,18 @@ function BluetoothController:onEvdevInputRemove(path)
     self:closeDevice(path)
 end
 
-function BluetoothController:pokeActivity()
-    if not _shared_last_power_reset_time
-        or time.since(_shared_last_power_reset_time) >= time.s(POWER_RESET_INTERVAL) then
-        _shared_last_power_reset_time = time.now()
-        Device:getPowerDevice():resetT1Timeout()
-    end
-end
-
 function BluetoothController:handleInputEvent(ev)
     if not self.opened_fd or ev.fd ~= self.opened_fd then return end
 
     local direction = self:parseInputDirection(ev)
     if not direction then return end
 
-    self:pokeActivity()
+    -- 翻页即活动：节流着喂看门狗，免得读到一半自动休眠
+    if not _shared_last_power_reset_time
+        or time.since(_shared_last_power_reset_time) >= time.s(POWER_RESET_INTERVAL) then
+        _shared_last_power_reset_time = time.now()
+        Device:getPowerDevice():resetT1Timeout()
+    end
 
     UIManager:sendEvent(Event:new("GotoViewRel",
         self.config.invert_layout and -direction or direction))

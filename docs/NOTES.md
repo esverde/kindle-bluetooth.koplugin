@@ -970,8 +970,8 @@ function _M.open(host, port, create)
 结果是 **`popen` 那半裸着** —— `io.popen` 返回 nil 时后面的 `pipe:read` 会直接
 崩掉菜单，所以又得补一行 `if not pipe then return nil end` 守卫。
 
-现在的形状：`fetchBatteryLevel` 里做 popen + read + close + decode + 匹配，
-`readBatteryLevel` 只剩两件事 —— `pgrep` 门禁和一个 `pcall`。一个边界罩住全部，
+现在的形状：popen + read + close + decode + 匹配全都在 `readBatteryLevel` 内部那个
+被 `pcall` 包住的闭包里，函数本体只剩 `pgrep` 门禁。一个边界罩住全部，
 于是 nil 守卫、`body or ""`、`data.connections or {}` 这些补丁全都不需要了
 （少 7 行）。
 
@@ -1256,63 +1256,6 @@ KOReader 要是改名或删掉 `turnOnWifi`，没有这一判就会把 `nil` 当
 
 ---
 
-## §15 与主分支合并：核实过的事实（方案本身已取消）
-
-曾写过一份逐任务的合并计划（`docs/plans/2026-09-04-unify-classic-ble.md`，869 行），
-用户决定不做，整份删掉了。只保留下面这些**核实过、且重新查一遍要花时间**的事实。
-真要合并时从这里起步，不必再推一遍。
-
-### 分支拓扑：不能用 merge
-
-```
-merge-base(main, ble) == main 的 tip
-main 在基点之后：0 个提交
-```
-
-`main` 是 `ble` 的**祖先**，`git merge main` 只会输出 `Already up to date.`。经典蓝牙
-那套代码是被 `56ee51d` 从共同历史里删掉的，唯一来源是 `git show e97a38b:main.lua`，
-得手工挑段落添加。
-
-反过来说，`ble` 侧的精简**不可能被 merge 冲掉**。真正的风险是**手工取回时连带抄回
-已删的东西**：`override`、`saveOverride`、`reloadDevice`、`btLipc`、`all_centered`
-循环、类表上那些空操作字段。
-
-### 取回的代码是「老标准下审过的」
-
-经典蓝牙那块在共同历史里过了 3 轮 ponytail，但 `ble` 后续几轮的规则没作用到它。
-至少三处要顺手改：`btLipc()` 单调用点内联进 `getRealState`；`setBluetoothState` 里
-两个单次使用的局部变量合并；类表上的 `_state_cached = false` 删掉。
-
-**一条明确不能动**：`onDispatcherRegisterActions` 看着是 8 行单调用点，但
-`dispatcher.lua:640` 会 `broadcastEvent(Event:new("DispatcherRegisterActions"))`，
-L648-653 的官方示例正是「定义同名方法**并且**在 init 里自己调一次」。内联或改名
-会让插件在 Dispatcher 重建动作表时丢失注册。
-
-### 多配置与菜单分流的两个关键点
-
-**`sub_item_table_func` 在任意层级生效**，包括顶层插件条目（`touchmenu.lua:875`：
-`item.sub_item_table_func and item.sub_item_table_func() or item.sub_item_table`，
-在 `onMenuSelect` 里通用处理）。所以「菜单每次打开重建、不相关的项直接不发出来」
-是可行的，比 `enabled_func` 灰显干净。注意菜单**搜索**也会调它
-（`touchmenu.lua:1005`），所以构建函数必须便宜。
-
-**`supports_dpad` 有个会锁死的坑**：主分支用 `enabled_func` 灰显「摇杆模式」。若
-覆盖值里存过 `use_analog_mode = false`，之后换成没有十字键的手柄，会得到「菜单灰显
-改不回来 + 走十字键解析路径 + 手柄不发 HAT 事件」= **完全不能翻页**。这是当初在
-本分支整段删掉模式切换的原因（`c2b4f29`）。重新引入必须同时加：`supports_dpad`
-为假时强制 `use_analog_mode = true`，忽略覆盖值。
-
-### 被否掉的四个方案
-
-| 方案 | 为什么不做 |
-| --- | --- |
-| 抽 `ClassicDriver` / `BleDriver` 接口 | 两个实现、永远两个。`if link == "classic"` 出现 3 次比接口加两个文件短 |
-| 按手柄名自动匹配配置 | 要维护名字模式表，而 `device_path` 已经够用 |
-| 迁移旧的扁平覆盖值 | 两个字段、一个用户，最坏是进菜单重点一次。迁移代码是永久成本 |
-| `khp` 路径做成每配置可配 | 它是插件目录内的固定位置 |
-
----
-
 ## §16 多手柄配置：按名字解析，而不是按节点路径
 
 `bluetooth.lua` 从单份扁平表改成了**配置数组**，生效的那份由 `resolveProfile`
@@ -1345,9 +1288,8 @@ async def _serve(self):            # 按协议起 handler，不是按设备
 于是 `match_name`（Lua 模式）取代了 `device_path`，**顺带消灭了 `eventN` 漂移
 这个长期痛点**：路径改为由扫描结果给出。
 
-> §15 的「被否掉的方案」表里写着「按手柄名自动匹配 —— 要维护名字模式表，而
-> `device_path` 已经够用」。**那个前提在两个手柄之后不成立了**，所以这条否决翻案。
-> 原判断没错，是条件变了。
+> 早先否决过这个做法，理由是「要维护名字模式表，而 `device_path` 已经够用」。
+> **那个前提在两个手柄之后不成立了**，所以否决翻案。原判断没错，是条件变了。
 
 ### 顺带简化掉的东西
 

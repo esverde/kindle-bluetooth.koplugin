@@ -38,15 +38,6 @@ body:
       required: true
 
   - type: input
-    id: khp
-    attributes:
-      label: kindle-hid-passthrough version
-      description: "Run `./kindle-hid-passthrough --diagnostics`, or read `version` from the daemon status."
-      placeholder: "3.16.0"
-    validations:
-      required: true
-
-  - type: input
     id: controller
     attributes:
       label: Controller
@@ -84,7 +75,7 @@ body:
     id: daemon_log
     attributes:
       label: Daemon log
-      description: "`tail -40 <plugin>/khp/hid_passthrough.log` — remember to redact addresses."
+      description: "`tail -40 <plugin>/khp/hid_passthrough.log` — remember to redact addresses. The daemon version is on its first line, so please include the start of the log if you have it."
       render: text
 
   - type: textarea
